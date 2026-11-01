@@ -10,6 +10,8 @@
      —— 推荐这条路：转写质量可以人工过一眼，也方便以后换 ASR
   2) 没有转写：自动找可用的 ASR（faster-whisper / whisper CLI / vosk），
      抽 16k 单声道音频到卡目录临时文件 → 转写 → 立刻删音频
+     国内下载模型慢的话先设 HF_ENDPOINT=https://hf-mirror.com；
+     模型用 --asr-model 选（tiny 最快但中文糙，small 是默认）
 
 用法：
     python tools/media_audio.py --file 语音.m4a --captions 语音.txt
@@ -75,18 +77,31 @@ def load_transcript(path):
     return out
 
 
+def _read_wav_16k(path):
+    """自己读 wav 成 float32 数组：绕开 av/ffmpeg 解码（av 19 与 faster-whisper
+    1.2 的 metadata_errors 参数不兼容，直接喂数组最省事）。"""
+    import numpy as np
+    import wave
+    with wave.open(path, "rb") as w:
+        assert w.getnchannels() == 1, "要单声道"
+        assert w.getframerate() == 16000, "要 16k"
+        raw = w.readframes(w.getnframes())
+    return np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
+
+
 def try_asr(wav):
     """按可用性依次尝试。返回 (segments, backend) 或 (None, 原因)。"""
+    last = ""
     try:
-        import faster_whisper  # noqa: F401
         from faster_whisper import WhisperModel
+        audio = _read_wav_16k(wav)
         model = WhisperModel(os.environ.get("WHALE_ASR_MODEL", "small"),
                              device="cpu", compute_type="int8")
-        segs, _info = model.transcribe(wav, language="zh", vad_filter=True)
+        segs, _info = model.transcribe(audio, language="zh", vad_filter=True)
         return ([{"t": float(s.start), "text": (s.text or "").strip()}
                  for s in segs if (s.text or "").strip()], "faster-whisper")
-    except Exception:
-        pass
+    except Exception as e:
+        last = repr(e)[:160]
     cli = shutil.which("whisper")
     if cli:
         try:
@@ -102,7 +117,8 @@ def try_asr(wav):
                     return ([s for s in segs if s["text"]], "whisper-cli")
         except Exception:
             pass
-    return None, "没有可用的 ASR（pip install faster-whisper，或先用 --transcript 给转写）"
+    return None, ("没有可用的 ASR（pip install faster-whisper，或先用 --transcript 给转写）"
+                  + ("；最后一次错误：%s" % last if last else ""))
 
 
 def main(argv=None):
@@ -110,6 +126,8 @@ def main(argv=None):
     ap.add_argument("--file", default="", help="音频或视频文件（--asr 时才需要）")
     ap.add_argument("--transcript", default="", help="已有转写（txt / jsonl）")
     ap.add_argument("--asr", action="store_true", help="自动找 ASR 转写（要先装）")
+    ap.add_argument("--asr-model", default="",
+                    help="faster-whisper 模型：tiny/base/small…（默认 small；tiny 更快但中文糙）")
     ap.add_argument("--db", default=DEFAULT_DB)
     ap.add_argument("--speaker", default="user")
     ap.add_argument("--note", default="", help="给这批记忆加一句上下文（拼在每条前面）")
@@ -137,6 +155,8 @@ def main(argv=None):
             print(json.dumps({"ok": False, "why": "抽音频失败", "detail": err},
                              ensure_ascii=False))
             return 1
+        if a.asr_model:
+            os.environ["WHALE_ASR_MODEL"] = a.asr_model
         segs, src = try_asr(wav)
         shutil.rmtree(tmpdir, ignore_errors=True)   # 声音不落盘
         if segs is None:

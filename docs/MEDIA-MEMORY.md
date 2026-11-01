@@ -157,3 +157,29 @@ attach ──► 有引用 ──► 权重随幂律下降
 6. `verify_media()` 对"被手工 rm 掉的文件"报坏，对"按规则删的"报已知删除
 7. 控制台记忆页：双曲线（文字 vs 画面）+ 每张图剩余强度条
 
+
+## 7. 语音：只留它说的话
+
+声音不落盘。`tools/media_audio.py --file x.m4a --asr` 会抽 16k 单声道 wav 到卡目录临时文件 → 转写 → **立刻删掉音频**，只把转出来的句子写成文字记忆（跟着文字那条曲线风化）。
+
+三种转写输入，任选：
+
+| 方式 | 什么时候用 |
+|---|---|
+| `--transcript x.txt` | 已经有人工/别处转写（每行一句，或 `[00:12] 前缀`），质量最好 |
+| `--transcript x.jsonl` | 转写带时间戳（`{"t":12.3,"text":"..."}`） |
+| `--asr` | 本机装了 faster-whisper，自动转 |
+
+装 ASR（可选，约 200MB 依赖 + 模型）：
+
+```bash
+pip install faster-whisper
+# 国内下模型慢，先设镜像
+set HF_ENDPOINT=https://hf-mirror.com
+python tools/media_audio.py --file 语音.m4a --asr --asr-model tiny
+```
+
+- `tiny`：约 75MB，5 秒音频几秒出结果，中文会漏字（实测「那天晚上我们在路边摊吃烧烤，辣椒特别辣」→ 分成两句、基本准确）
+- `small`：约 500MB，CPU 上慢十倍左右，中文明显更准（默认）
+- 一个坑：`av>=19` 与 faster-whisper 1.2 的文件解码参数不兼容（`open() got an unexpected keyword argument 'metadata_errors'`），所以我们**自己用 `wave` 读成 float32 数组**再喂模型，绕开它
+- 另一条路：`pip install openai-whisper` 后命令行有 `whisper`，工具会自动退到它（同样会试）

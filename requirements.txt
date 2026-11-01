@@ -4,3 +4,5 @@ psutil>=5.9
 
 # 可选：只有跑 tests/test_t52.py（原文归档压缩）时需要
 # zstandard>=0.22
+# 可选：语音转写（装了 tools/media_audio.py 才能用 --asr）
+# faster-whisper>=1.2
