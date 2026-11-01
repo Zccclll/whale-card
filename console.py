@@ -348,21 +348,10 @@ def card_metrics(db_path=DEFAULT_DB):
         except Exception:
             pass
 
-        # PAD 三维读法（和 card2.mood_pad 同一套公式，只读）
-        try:
-            h = {}
-            for r in c.execute("SELECT key, val FROM meta"):
-                if r["key"] in ("h_sero", "h_dopa", "h_cort", "h_oxy"):
-                    h[r["key"]] = _f(r["val"])
-            sero = h.get("h_sero", 0.5); dopa = h.get("h_dopa", 0.5)
-            cort = h.get("h_cort", 0.5); oxy = h.get("h_oxy", 0.5)
-            out["pad"] = {
-                "p": round(0.5 * sero + 0.5 * dopa, 3),
-                "a": round(0.6 * dopa + 0.4 * cort, 3),
-                "d": round(0.6 * oxy + 0.4 * (1.0 - cort), 3),
-            }
-        except Exception:
-            pass
+        # PAD 三维：**不在这里算**。
+        # 公式只有 card2.mood_pad() 一处（心境 → P，四激素 → A/D，相对基线），
+        # 页面直接读 /status.pad。以前这里抄了一份，两份各自进化就会悄悄分家，
+        # 而且没有任何东西会报错 —— 那种"看着差不多"的分歧最难查。
 
         c.close()
     except Exception as e:
@@ -1796,13 +1785,15 @@ function viewDash(){
     '<div class="legend" style="margin-top:7px">MOOD 心境 '+
       (last.mood!=null?last.mood.toFixed(2):"—")+
       ' · LIVE 每 tick 更新 · Δ 对比 24H 起点</div>'+
-    /* PAD 三维：把四个数换一个角度念出来（只读，不改激素） */
+    /* PAD 三维：读服务端的 /status.pad（公式只有 card2.mood_pad 一处） */
     (function(){
-      var pad=m.pad||{};
+      var pad=(d.status&&d.status.pad)||{};
       if(pad.p==null) return "";
-      return '<div class="legend" style="margin-top:5px">PAD 愉悦 '+
-        pad.p.toFixed(2)+' · 唤醒 '+pad.a.toFixed(2)+
-        ' · 掌控 '+pad.d.toFixed(2)+'</div>';
+      var sgn=function(v){ return (v>0?"+":"")+v.toFixed(2); };
+      return '<div class="legend" style="margin-top:5px">PAD '+
+        esc(pad.label||"")+' ｜ 愉悦 '+sgn(pad.p)+
+        ' · 唤醒 '+sgn(pad.a)+' · 掌控 '+sgn(pad.d)+
+        ' <span style="color:#3f5164">−1..1 · 0=平静</span></div>';
     })()+
     '<div style="margin-top:8px">'+ledger(hled)+'</div>'+
     '<div class="legend" style="margin-top:6px">PEAK/LOW '+esc(peakTxt.join(" · "))+'</div>');
@@ -2489,6 +2480,8 @@ function refresh(){
     S.data.timeline = (st && st.status && st.status.timeline) || {};
     S.up = (st && st.status && st.status.uptime_s) || 0;
     S.mood = (st && st.status && st.status.mood) || "";
+    /* PAD 从 /status 来（公式只在 card2.mood_pad 一处，这里不许再算） */
+    S.data.status = (st && st.status) || {}
     S.timeline = S.data.timeline;
     var now=new Date();
     S.stamp = "刷新于 "+now.toLocaleTimeString("zh-CN");

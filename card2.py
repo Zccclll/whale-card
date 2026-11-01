@@ -593,6 +593,72 @@ def mood_text(mood):
     return "还行"
 
 
+# ---------------------------------------------------------------------------
+# PAD 三维情绪（2026-11-01 第二版）
+#   P 愉悦：由心境给（心境是事件推出来的慢量，最适合当"高不高兴"）
+#   A 唤醒：多巴胺 + 皮质醇，相对基线 —— 高=绷着、低=没劲
+#   D 掌控：催产素 + 少压力，相对基线 —— 高=自在、低=发怵
+# 为什么要 A：心境只有一维，说不出"低落但平静"和"低落又紧绷"的区别。
+# 为什么相对基线：基线=平静=0，负数才表示"比平时还低"。
+# 这两条是这套东西唯一的价值；改公式前先想清楚这一点。
+# ---------------------------------------------------------------------------
+PAD_NEUTRAL_BAND = 0.15      # |P|、|A| 都小于这个数，读作"平静"
+PAD_AROUSAL_EDGE = 0.35      # A 超过这个数才算"绷着"，低于负数算"没劲"
+
+
+def pad_label(p, a):
+    """给 P/A 两个轴起个中文名。只用来显示，不参与任何判定。"""
+    if abs(p) < PAD_NEUTRAL_BAND and abs(a) < PAD_NEUTRAL_BAND:
+        return "平静"
+    if p >= PAD_NEUTRAL_BAND:
+        if a >= PAD_AROUSAL_EDGE:
+            return "雀跃"          # 高兴得坐不住
+        if a <= -PAD_AROUSAL_EDGE:
+            return "安稳"          # 高兴但懒懒的
+        return "愉快"
+    if p <= -PAD_NEUTRAL_BAND:
+        if a >= PAD_AROUSAL_EDGE:
+            return "紧绷"          # 低落又绷着 —— 一维心境说不出的那种
+        if a <= -PAD_AROUSAL_EDGE:
+            return "低落"          # 低落且没劲
+        return "闷闷的"
+    # 心情不高不低，但有情绪张力
+    if a >= PAD_AROUSAL_EDGE:
+        return "坐立不安"
+    if a <= -PAD_AROUSAL_EDGE:
+        return "没劲"
+    return "平静"
+
+
+def pad_style_hint(pad):
+    """把 PAD 翻成一句"我现在什么状态"，塞进上下文给宿主参考。
+
+    刻意只给状态、不给命令（跟 hormone.style_hint 同一套原则）：
+    「我在难过，别闹」比「请表现得难过一点」管用 —— 后者是让她演。
+    """
+    if not pad:
+        return ""
+    p = float(pad.get("p", 0.0) or 0.0)
+    a = float(pad.get("a", 0.0) or 0.0)
+    d = float(pad.get("d", 0.0) or 0.0)
+    bits = []
+    if p <= -0.35:
+        bits.append("现在心情很低")
+    elif p <= -PAD_NEUTRAL_BAND:
+        bits.append("现在心情不太好")
+    elif p >= 0.35:
+        bits.append("现在心情很好")
+    if a >= PAD_AROUSAL_EDGE:
+        bits.append("有点绷着" if d < 0.0 else "有点亢奋")
+    elif a <= -PAD_AROUSAL_EDGE:
+        bits.append("懒懒的，不想使劲")
+    if d <= -0.35 and p <= 0.0:
+        bits.append("没什么底气，别接玩笑")
+    elif d >= 0.35 and p >= PAD_NEUTRAL_BAND:
+        bits.append("心里挺踏实")
+    return "、".join(bits)
+
+
 def to_vec(text):
     """字符 bigram + 单字弱权重。
 
@@ -1530,37 +1596,50 @@ class MemoryCard:
             return False
 
     def mood_pad(self):
-        """把四激素翻译成 PAD 三个轴（Pleasure / Arousal / Dominance）。
+        """情绪的三维读数：P 愉悦 / A 唤醒 / D 掌控，全部映射到 −1..1。
 
-        🔧 2026-11-01 从 A 路线手册吸收：情绪用一个数（mood）表达太扁平，
-        PAD 三维能区分"低落但平静"和"低落又紧绷"。
+        🔧 2026-11-01 第二版。第一版是「拿四激素换三个 0~1 的数」，问题有两个：
+           ① 它是激素的复印件 —— 跟心境（mood）并列，等于两套情绪读数；
+           ② 基线状态读出来是 0.6/0.4/0.6 这种"看着挺高"的数，没有零点。
+        现在改成：**P 由心境给，A/D 由激素给，相对基线取偏移**。
+           基线状态（mood=0.5 + 四激素在 H_BASE）读出来正好是 p=a=d=0 = 平静。
+           于是「比平时低」才读得出来 —— 这才是三维比一维多出来的信息：
+           低落（P 负）分得清是"平静地低落"还是"紧绷着低落"（A 的差）。
 
-        这个映射是**读法，不是算法**：它不改激素、不进召回、不影响人格，
-        只是把现有的四个数换个角度念出来。所以可以随时改权重而不担心
-        改动历史行为。
+        ⚠️ 这是一个**纯读法**：不写库、不改激素、不进召回打分。
+           公式只有这一处，控制台必须读 /status.pad，不许自己再算一遍。
         """
-        h = self.h
-        sero = float(h.get("h_sero", 0.5))
-        dopa = float(h.get("h_dopa", 0.5))
-        cort = float(h.get("h_cort", 0.5))
-        oxy = float(h.get("h_oxy", 0.5))
-        p = 0.5 * sero + 0.5 * dopa                     # 愉悦：血清素+多巴胺
-        a = 0.6 * dopa + 0.4 * cort                     # 唤醒：多巴胺+皮质醇
-        d = 0.6 * oxy + 0.4 * (1.0 - cort)              # 掌控：安全感−压力
-        p, a, d = (round(max(0.0, min(1.0, x)), 3) for x in (p, a, d))
-        # 一句话标签（给人看的，不参与任何判定）
-        if p >= 0.6 and a < 0.55:
-            label = "安稳愉快"
-        elif p >= 0.6 and a >= 0.55:
-            label = "兴奋"
-        elif p < 0.4 and a >= 0.55:
-            label = "紧绷低落"
-        elif p < 0.4 and a < 0.55:
-            label = "低落平静"
-        else:
-            label = "平常"
-        return {"p": p, "a": a, "d": d, "label": label,
-                "src": {"sero": round(sero, 3), "dopa": round(dopa, 3),
+        base = getattr(hormone, "H_BASE", {"h_sero": 0.6, "h_dopa": 0.4,
+                                            "h_cort": 0.2, "h_oxy": 0.5})
+
+        def _num(v, dflt):
+            try:
+                x = float(v)
+                return dflt if (x != x) else x          # NaN 兜底
+            except Exception:
+                return dflt
+
+        h = getattr(self, "h", {}) or {}
+        sero = _num(h.get("h_sero"), base["h_sero"])
+        dopa = _num(h.get("h_dopa"), base["h_dopa"])
+        cort = _num(h.get("h_cort"), base["h_cort"])
+        oxy = _num(h.get("h_oxy"), base["h_oxy"])
+        mood = _num(getattr(self, "mood", MOOD_NEUTRAL), MOOD_NEUTRAL)
+
+        # 两条轴的基线值（从 H_BASE 算，改基线不用改这里）
+        a0 = 0.6 * base["h_dopa"] + 0.4 * base["h_cort"]
+        d0 = 0.6 * base["h_oxy"] + 0.4 * (1.0 - base["h_cort"])
+        k_a = 0.6 * dopa + 0.4 * cort
+        k_d = 0.6 * oxy + 0.4 * (1.0 - cort)
+
+        SCALE = 3.2      # 激素推到满时接近 ±1；太小天天顶格，太钝读不出来
+        p = (mood - MOOD_NEUTRAL) * 2.0
+        a = (k_a - a0) * SCALE
+        d = (k_d - d0) * SCALE
+        p, a, d = (round(max(-1.0, min(1.0, x)), 3) for x in (p, a, d))
+        return {"p": p, "a": a, "d": d, "label": pad_label(p, a),
+                "src": {"mood": round(mood, 3),
+                        "sero": round(sero, 3), "dopa": round(dopa, 3),
                         "cort": round(cort, 3), "oxy": round(oxy, 3)}}
 
     def touch_hormones(self, text):
@@ -3833,11 +3912,19 @@ class MemoryCard:
         # 🔧 V5.0 §4.4(4)：激素决定的「说话倾向」
         #    只给状态不给命令 —— 「话多一点」比「请活泼一点」有效，
         #    后者模型会照着演，前者它只是知道自己现在什么状态。
-        h = getattr(self, "h", None)
-        if h:
-            hint = hormone.style_hint(h)
-            if hint:
-                parts.append(hint)
+        # 🔧 2026-11-01：改成由 PAD 统一给（PAD 已经把心境 + 四激素算进去了，
+        #    再单独念一遍激素等于同一件事说两遍）。拿不到 PAD 才退回激素。
+        hint = ""
+        try:
+            hint = pad_style_hint(self.mood_pad())
+        except Exception:
+            hint = ""
+        if not hint:
+            h = getattr(self, "h", None)
+            if h:
+                hint = hormone.style_hint(h)
+        if hint:
+            parts.append(hint)
         if not parts:
             return ""
         return "（" + "，".join(parts) + "）"

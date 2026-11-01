@@ -37,18 +37,11 @@ from card2 import MemoryCard, assess_trust     # noqa: E402
 CASES = os.path.join(HERE, "eval", "cases.json")
 
 
-def _default_card():
-    """没指定就用仓库自带的示例卡；示例卡都没造就先跑 tools/make_demo_card.py。"""
-    demo = os.path.join(ROOT, "demo", "demo_card.db")
-    if os.path.exists(demo):
-        return demo
-    return os.path.join(ROOT, "card.db")
-
-
 def _card(path):
     if path:
         os.environ["WHALE_DB"] = os.path.abspath(path)
-    return MemoryCard(os.environ.get("WHALE_DB") or _default_card())
+    return MemoryCard(os.environ.get("WHALE_DB")
+                      or os.path.join(ROOT, "card.db"))
 
 
 def _hit_text(card, r, w):
