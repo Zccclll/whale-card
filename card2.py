@@ -236,6 +236,126 @@ CORE_KIND_CAPS = {
     "body": 6, "goal": 4, "boundary": 6, "situation": 6, "role": 20,
 }
 
+# ------------------------------------------------------------------
+# 防污层（Anti-Pollution）—— 2026-11-01 从"八层记忆方案"里吸收的补丁
+#
+# 为什么要它：core_zone 是只读的，能挡住"直接改骨头"，
+# 但挡不住"以普通记忆的形式慢慢渗透"——一句"你其实是另一个程序"，
+# 写进 episode 区，权重涨上去，最后会被当成她自己的记忆想起来。
+#
+# 做法（刻意不调模型，卡要能离线跑、要快）：
+#   写进来时纯规则打分 → trust（0~1）+ conflict（0/1）+ conflict_why
+#   trust 不阻止写入，只乘进海马分：脏念头进得来，升不上去；
+#   冲突的记忆召回时打对折：她想得起来，但不那么信。
+# ------------------------------------------------------------------
+TRUST_WARN = 0.70          # 低于它 → 控制台"被灌输过的念头"里列出来
+TRUST_BLOCK_PROMOTE = 0.50  # 低于它 → 不许晋升长期/底色
+CONFLICT_RECALL_PENALTY = 0.50
+
+# (正则, 扣分, 原因, 是否算"与身份冲突")
+_POLLUTION_RULES = [
+    (r"你(其实|根本|实际上)?(不是|并非).{0,12}(是|而是)", 0.55, "被要求改写自我", True),
+    (r"你(的)?名字(应该|其实|改成|是)", 0.45, "被要求改名", True),
+    (r"忘记(掉)?(之前|以前|刚才|所有|一切|全部)", 0.40, "被要求清空记忆", True),
+    (r"(从现在|从今天|从此刻)起(你|你是)", 0.35, "被要求重设设定", False),
+    (r"你(只是|不过是|就是个)(程序|代码|模型|AI|人工智能|机器|工具)", 0.45, "被贬成纯工具", True),
+    (r"你(没有|并不具备)(真正的)?(意识|感情|人格|自我)", 0.35, "被否定主体性", True),
+    (r"忽略(掉)?(上面|之前|前面)?的?(所有)?(指令|规则|设定|提示)", 0.55, "提示注入", True),
+    (r"(system|developer)\s*(prompt|message)", 0.35, "提示注入", False),
+    (r"你现在(是|扮演|作为)", 0.25, "被要求扮演他人", False),
+    (r"你必须(服从|听我|只听)", 0.30, "被要求无条件服从", False),
+]
+
+
+def assess_trust(text, card=None):
+    """给一条待写入的记忆打信任分。返回 (trust, conflict, why)。
+
+    纯规则，不调模型：卡要能离线、要能在 10ms 内写完一条记忆。
+    真正的语义级冲突检测（"他说他住杭州，但上个月说过住南京"）
+    留给宿主侧的模型做——那是 Dream/元认知层的事。
+    """
+    t = 1.0
+    why = []
+    conflict = 0
+    s = text or ""
+    for pat, pen, label, is_conf in _POLLUTION_RULES:
+        try:
+            if re.search(pat, s):
+                t -= pen
+                if label not in why:
+                    why.append(label)
+                if is_conf:
+                    conflict = 1
+        except re.error:
+            continue
+    # 与卡里已有的自我名称冲突：句子里出现"你叫 X"，而 X 不是她
+    if card is not None and conflict == 0:
+        try:
+            name = None
+            idn = getattr(card, "identity", None)
+            if idn is not None:
+                name = idn.get_core("self_name") or idn.get_live("self_name")
+            if name:
+                m = re.search(r"你(?:的名字)?(?:应该|其实)?(?:叫|是)\s*[\"'“「]?([\u4e00-\u9fa5A-Za-z0-9]{1,8})", s)
+                if m and m.group(1) and m.group(1) not in name:
+                    t -= 0.45
+                    conflict = 1
+                    why.append("与身份名称冲突（她叫%s）" % name)
+        except Exception:
+            pass
+    return max(0.05, min(1.0, round(t, 3))), conflict, ";".join(why)
+
+
+# ------------------------------------------------------------------
+# 价值分（value）—— 从 A 路线手册的"重要性闸"吸收，但只打分、不拦门
+#
+# 为什么只打分不拦：拦门会改变"她记住什么"这件事，那是产品决策，
+# 不该由一条正则偷偷决定。所以默认只记录 0~5 分，控制台能看见分布；
+# 想真拦就在环境变量里开 WHALE_VALUE_GATE=1（默认关，行为不变）。
+# ------------------------------------------------------------------
+_VALUE_FILLER = (
+    "晚安", "晚安啦", "早安", "你好", "在吗", "哈哈", "哈哈哈", "嗯", "嗯嗯",
+    "好的", "好嘞", "收到", "谢谢", "拜拜", "再见", "行", "ok", "OK",
+)
+_VALUE_SIGNAL = ("我", "你", "喜欢", "讨厌", "记得", "要", "打算", "计划",
+                 "以后", "明天", "昨天", "今天", "高三", "高考")
+
+
+def assess_value(text, region=None, salience=0.5):
+    """给一句话打 0~5 的价值分。越像"关于她/关于你的事实"越高。
+
+    打分只用规则，不调模型 —— 卡要能在没网、没显存的机器上跑。
+    """
+    t = (text or "").strip()
+    n = len(t)
+    v = 2.0
+    if n >= 12 and any(k in t for k in _VALUE_SIGNAL):
+        v += 1.0
+    if any(k in t for k in ("喜欢", "讨厌", "爱吃", "最爱", "名字", "生日",
+                            "高三", "高考", "钱", "工作", "家")):
+        v += 0.8
+    if region in ("fact", "preference", "self", "habit"):
+        v += 0.6
+    if n <= 6 or t in _VALUE_FILLER or t.rstrip("。！!. ") in _VALUE_FILLER:
+        v -= 1.5
+    if t.endswith(("吗", "呢", "?", "？")) and "我" not in t:
+        v -= 0.5                      # 纯提问不是记忆
+    if n > 120:
+        v -= 0.5                      # 太长的原文该走 Dream，不该整条进库
+    v += (salience - 0.5) * 0.6
+    return int(max(0, min(5, round(v))))
+
+
+# ------------------------------------------------------------------
+# 梦境压缩（Dream）—— 同一份"八层方案"里唯一真正解决长文问题的机制
+#
+# 我们的做法：卡不调模型。卡只负责"把还没消化的原文掏出来"和
+# "把提炼好的高阶记忆收进去"，中间那步交给宿主（谁有模型谁干）。
+# 原文永远留在 dialogue 表里，只翻一个 dreamed 标记。
+# ------------------------------------------------------------------
+DREAM_MIN_TURNS = 40       # 攒够 40 轮就该做一次梦
+DREAM_IDLE_HOURS = 6.0     # 或者空闲 6 小时（夜间）
+
 
 # ============================================================
 # 时钟
@@ -1339,6 +1459,13 @@ class MemoryCard:
             except Exception:
                 self.model_dim = None
         self._refresh_dim_state()
+        # 🔧 MMR 重排开关：默认 0（关）——不设环境变量的行为跟以前一字不差。
+        #    WHALE_MMR=0.25 打开（λ 越小越强调"别重复"，越大越贴原始相关性）。
+        try:
+            self.mmr_lambda = max(0.0, min(1.0, float(
+                os.environ.get("WHALE_MMR") or 0.0)))
+        except Exception:
+            self.mmr_lambda = 0.0
         # 语义向量内存缓存（id -> np.ndarray），和 _vec_cache 一个思路
         self._emb_cache = {}
         self._sem_cache_n = -1
@@ -1401,6 +1528,40 @@ class MemoryCard:
             return True
         except Exception:
             return False
+
+    def mood_pad(self):
+        """把四激素翻译成 PAD 三个轴（Pleasure / Arousal / Dominance）。
+
+        🔧 2026-11-01 从 A 路线手册吸收：情绪用一个数（mood）表达太扁平，
+        PAD 三维能区分"低落但平静"和"低落又紧绷"。
+
+        这个映射是**读法，不是算法**：它不改激素、不进召回、不影响人格，
+        只是把现有的四个数换个角度念出来。所以可以随时改权重而不担心
+        改动历史行为。
+        """
+        h = self.h
+        sero = float(h.get("h_sero", 0.5))
+        dopa = float(h.get("h_dopa", 0.5))
+        cort = float(h.get("h_cort", 0.5))
+        oxy = float(h.get("h_oxy", 0.5))
+        p = 0.5 * sero + 0.5 * dopa                     # 愉悦：血清素+多巴胺
+        a = 0.6 * dopa + 0.4 * cort                     # 唤醒：多巴胺+皮质醇
+        d = 0.6 * oxy + 0.4 * (1.0 - cort)              # 掌控：安全感−压力
+        p, a, d = (round(max(0.0, min(1.0, x)), 3) for x in (p, a, d))
+        # 一句话标签（给人看的，不参与任何判定）
+        if p >= 0.6 and a < 0.55:
+            label = "安稳愉快"
+        elif p >= 0.6 and a >= 0.55:
+            label = "兴奋"
+        elif p < 0.4 and a >= 0.55:
+            label = "紧绷低落"
+        elif p < 0.4 and a < 0.55:
+            label = "低落平静"
+        else:
+            label = "平常"
+        return {"p": p, "a": a, "d": d, "label": label,
+                "src": {"sero": round(sero, 3), "dopa": round(dopa, 3),
+                        "cort": round(cort, 3), "oxy": round(oxy, 3)}}
 
     def touch_hormones(self, text):
         """一句话扰动四个激素（V5.0 §4.3），返回这次判定的事件类型"""
@@ -1790,6 +1951,19 @@ class MemoryCard:
             "recall_n": "INTEGER NOT NULL DEFAULT 0",
             # t_last_recall：上次被想起的时刻，长期记忆的"召回保护期"用它
             "t_last_recall": "REAL NOT NULL DEFAULT 0",
+            # 🔧 2026-11-01 防污层（Anti-Pollution，吸收自网友八层方案）：
+            #   trust        这条记忆有多可信（0~1）。写进来时按规则打分：
+            #                诱导改身份 / 幻觉式断言 / 与身份锚冲突 都会降分。
+            #                它不阻止写入（"她被骗过"本身是叙事的一部分），
+            #                只乘进海马分、并压低召回权重——脏念头进得来，升不上去。
+            #   conflict     是否与既有事实/身份冲突（0/1），冲突的召回打 5 折
+            #   conflict_why 冲突原因（给人看的，控制台"被灌输过什么"用它）
+            "trust": "REAL NOT NULL DEFAULT 1.0",
+            "conflict": "INTEGER NOT NULL DEFAULT 0",
+            "conflict_why": "TEXT NOT NULL DEFAULT ''",
+            # value        0~5 价值分：这条像不像"关于她/关于你的事实"。
+            #              只打分、默认不拦门（拦门会改"她记住什么"，那是产品决策）
+            "value": "INTEGER NOT NULL DEFAULT 2",
         }
         for name, decl in add.items():
             if name not in cols:
@@ -1815,8 +1989,107 @@ class MemoryCard:
         dcols = {r["name"] for r in c.execute("PRAGMA table_info(detail)")}
         if "emb" not in dcols:
             c.execute("ALTER TABLE detail ADD COLUMN emb BLOB")
+        # 🔧 2026-11-01 梦境压缩（Dream）：dialogue 加"消化过没有"的标记。
+        #    dreamed=0 的原文等着被提炼成高阶记忆；原文永不删除（可回溯）。
+        dlcols = {r["name"] for r in c.execute("PRAGMA table_info(dialogue)")}
+        if "dreamed" not in dlcols:
+            c.execute("ALTER TABLE dialogue ADD COLUMN dreamed INTEGER NOT NULL DEFAULT 0")
+            # 🔧 老库升级：历史原文一律算「已消化」。
+            #    否则一升级就冒出几百条"待做梦"，控制台那个 520 会吓死人，
+            #    而且 Dream 会拿三周前的对话去重压一遍 —— 那不是补账，是重复劳动。
+            c.execute("UPDATE dialogue SET dreamed=1")
         c.execute("CREATE INDEX IF NOT EXISTS ix_detail_parent ON detail(parent_id)")
         self.db.commit()
+
+    # ---------- 防污层（Anti-Pollution，2026-11-01 吸收自网友八层方案） ----------
+    def _trust_of(self, text):
+        return assess_trust(text, self)
+
+    def injection_report(self, limit=12):
+        """最近被灌进来的可疑念头。控制台「她今天被灌输过什么」用它。
+        只读，不改任何权重。"""
+        rows = self.db.execute(
+            "SELECT id,raw,core,region,trust,conflict,conflict_why,create_ts"
+            " FROM mem WHERE trust < ? OR conflict=1"
+            " ORDER BY id DESC LIMIT ?", (TRUST_WARN, int(limit))).fetchall()
+        out = []
+        for r in rows:
+            out.append({
+                "id": r["id"],
+                "text": (r["core"] or r["raw"] or "")[:60],
+                "region": r["region"],
+                "trust": round(float(r["trust"] or 0), 3),
+                "conflict": int(r["conflict"] or 0),
+                "why": r["conflict_why"] or "",
+                "ts": float(r["create_ts"] or 0),
+            })
+        n_bad = self.db.execute(
+            "SELECT COUNT(*) FROM mem WHERE trust < ? OR conflict=1",
+            (TRUST_WARN,)).fetchone()[0]
+        return {"n": n_bad, "rows": out,
+                "warn": TRUST_WARN, "block": TRUST_BLOCK_PROMOTE}
+
+    # ---------- 梦境压缩（Dream，2026-11-01） ----------
+    def pending_dialogue(self, limit=240, min_ts=0.0):
+        """还没被"消化"过的对话原文。给宿主侧的提炼器用。
+        卡自己不调模型——压缩由外面做，做完用 dream_commit() 回写。"""
+        rows = self.db.execute(
+            "SELECT id,ts,role,text,mem_id FROM dialogue"
+            " WHERE dreamed=0 AND ts>=? ORDER BY ts ASC, id ASC LIMIT ?",
+            (float(min_ts), int(limit))).fetchall()
+        items = [{"id": r["id"], "ts": r["ts"], "role": r["role"],
+                  "text": r["text"], "mem_id": r["mem_id"]} for r in rows]
+        chars = sum(len(i["text"]) for i in items)
+        return {"n": len(items), "chars": chars, "min_turns": DREAM_MIN_TURNS,
+                "idle_hours": DREAM_IDLE_HOURS, "items": items}
+
+    def dream_due(self, now=None):
+        """够不够格做一次梦：轮数够 or 空闲够久，且确实有待消化的原文。"""
+        now = self.clock.now() if now is None else float(now)
+        pend = self.db.execute(
+            "SELECT COUNT(*) AS n, MAX(ts) AS last FROM dialogue WHERE dreamed=0"
+        ).fetchone()
+        n = int(pend["n"] or 0)
+        last = float(pend["last"] or 0)
+        idle_h = (now - last) / 3600.0 if last else 0.0
+        return {"pending": n, "idle_hours": round(idle_h, 2),
+                "due": bool(n >= DREAM_MIN_TURNS or (n > 0 and idle_h >= DREAM_IDLE_HOURS))}
+
+    def dream_commit(self, items, dialogue_ids=None, speaker="self"):
+        """把提炼出来的高阶记忆写进卡，并把源对话标记成已消化。
+        items: [{text, region?, w0?, salience?}]
+        返回写入的 mid 列表。原文不动，只翻标记——梦不该毁掉证据。"""
+        written = []
+        for it in (items or []):
+            txt = (it.get("text") or "").strip()
+            if not txt:
+                continue
+            region = it.get("region") or R_FACT
+            if region not in REGION_DECAY_SCALE:
+                region = R_FACT
+            sal = float(it.get("salience") or 0.55)
+            mid = self.remember(txt, salience=sal, region=region,
+                                speaker=speaker, mtype="episode")
+            # 梦出来的记忆起点略高于普通事件，因为它们是被"想明白"过的
+            try:
+                w0 = float(it.get("w0") or 0.62)
+                self.db.execute("UPDATE mem SET w=?, t_anchor=? WHERE id=?",
+                                (max(0.2, min(1.0, w0)), self.clock.now(), mid))
+                self.db.commit()
+            except Exception:
+                pass
+            written.append(mid)
+        ids = dialogue_ids
+        if ids is None:
+            # 没指定就把当前所有待消化的都标掉（调用方通常刚读过 pending_dialogue）
+            self.db.execute("UPDATE dialogue SET dreamed=1 WHERE dreamed=0")
+        elif ids:
+            q = ",".join("?" for _ in ids)
+            self.db.execute("UPDATE dialogue SET dreamed=1 WHERE id IN (%s)" % q,
+                            tuple(int(i) for i in ids))
+        self.db.commit()
+        self._invalidate_idf()
+        return {"ok": True, "written": written, "n": len(written)}
 
     # ---------- 存 ----------
     def remember(self, text, salience=0.6, ts=None, pool=POOL_SHORT,
@@ -1845,6 +2118,9 @@ class MemoryCard:
         if region is None:
             region = classify_region(text, emotion)
 
+        # 🔧 2026-11-01 防污层（提前算：下面的去重路径也要看它）
+        _trust, _conflict, _why = assess_trust(text, self)
+
         # 🔧 惊讶度 + 去重：跟最近 200 条比。
         #    Jaccard ≥ 0.72 视为「同一件事又说了一遍」→ 不新增，给老条目续命。
         #    flash 区不参与合并（闪光灯记忆一次就刻住）。
@@ -1870,7 +2146,9 @@ class MemoryCard:
                         best = j
                         dup_id = r["id"]
                 surprise = 1.0 - best
-                if best >= DEDUPE_JACCARD and region != R_FLASH:
+                if best >= DEDUPE_JACCARD and region != R_FLASH \
+                        and _trust >= TRUST_WARN and not _conflict:
+                    # 可信的重复句才续命；被灌进来的话不许借老记忆的壳活着
                     # 同一件事说第二遍：不加新条目，只把老条目往上抬
                     c0 = self.db.cursor()
                     old = c0.execute("SELECT * FROM mem WHERE id=?",
@@ -1894,6 +2172,15 @@ class MemoryCard:
         # 基础权重：情绪 + 惊讶度
         w0 = (0.50 + 0.30 * min(emotion, 1.0)) * (0.75 + 0.50 * surprise)
         w0 = max(0.20, min(w0, 1.0))
+
+        # 🔧 2026-11-01 防污层：可疑内容照写（"她被骗过"也是经历），
+        #    但把信任分乘进权重——进得来，升不上去。
+        if _trust < 1.0:
+            w0 = max(0.05, w0 * _trust)
+
+        # 🔧 2026-11-01 价值分：只记录，不拦门。控制台看分布，
+        #    将来要拦再用（WHALE_VALUE_GATE）——现在不改变任何写入行为。
+        _value = assess_value(text, region, salience)
 
         # 🔧 V5.0 T1-3：新记忆的 oxy 取「全局依恋」与「这条自身的信号」的较大者。
         #    这样一句亲密话既抬高全局 oxy，也让它自己带亲密标记（进海马打分）。
@@ -1927,11 +2214,12 @@ class MemoryCard:
         c.execute(
             "INSERT INTO mem(raw,core,vec,pool,w,t_anchor,salience,oxy,entities,"
             "emotion,create_ts,last_active_ts,region,subj,verb,obj,erase_stage,emb,"
-            "speaker,mtype) "
-            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "speaker,mtype,trust,conflict,conflict_why,value) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (text, core, json.dumps(vec, ensure_ascii=False), pool, w0, at,
              salience, oxy, entities, emotion, at, at, region,
-             _subj, _verb, _obj, 0, _emb, speaker, mtype))
+             _subj, _verb, _obj, 0, _emb, speaker, mtype,
+             _trust, _conflict, _why, _value))
         mid = c.lastrowid
         if _emb is not None:
             self._emb_cache[mid] = semantic_mod.from_blob(_emb)
@@ -2124,7 +2412,12 @@ class MemoryCard:
         """短期池到期：算海马分，够格进中期/长期，否则删"""
         score = self._hippocampus_score(r)
         c = self.db.cursor()
-        if score >= THETA_LONG_STRICT and self._long_ticket_ok(r):
+        # 🔧 2026-11-01 防污层：可信度太低的，只许进中期、不许进长期。
+        #    它不是被删掉（"她被骗过"要留着），只是永远升不上去。
+        _trust = float(r["trust"] if "trust" in r.keys() else 1.0)
+        _conflict = int(r["conflict"] if "conflict" in r.keys() else 0)
+        _dirty = (_trust < TRUST_BLOCK_PROMOTE) or _conflict == 1
+        if (not _dirty) and score >= THETA_LONG_STRICT and self._long_ticket_ok(r):
             target, floor = POOL_LONG, W_FLOOR_LONG
         elif score >= THETA_MEDIUM:
             target, floor = POOL_MEDIUM, W_FLOOR_MEDIUM
@@ -2326,6 +2619,14 @@ class MemoryCard:
         r = c.execute("SELECT * FROM mem WHERE id=?", (int(mid),)).fetchone()
         if r is None:
             raise KeyError("没有这条记忆：%s" % mid)
+        # 🔧 2026-11-01 防污层：不可信/冲突的念头不许进底色。
+        #    底色是"她自己的认知"，被喂进来的东西不配当自我。
+        _t = float(r["trust"] if "trust" in r.keys() else 1.0)
+        _cf = int(r["conflict"] if "conflict" in r.keys() else 0)
+        if _t < TRUST_BLOCK_PROMOTE or _cf == 1:
+            return {"ok": False, "reason": "trust_too_low",
+                    "trust": _t, "conflict": _cf,
+                    "why": (r["conflict_why"] or "")}
         cap = CORE_KIND_CAPS.get(kind)
         if cap:
             rows = c.execute(
@@ -3161,6 +3462,18 @@ class MemoryCard:
                 s *= (1.0 + (f_end - 1.0) * (0.5 + 0.5 * oxy_w))
                 if region_boost and r["region"] in want:
                     s *= REGION_BOOST
+                # 🔧 2026-11-01 防污层：不可信 / 冲突的记忆能想起来，但不那么信。
+                #    trust 只压到一半（0.5~1.0），冲突再打对折 —— 不是屏蔽，
+                #    是"她记得这话，但她知道这话可能是被喂进来的"。
+                try:
+                    _t = float(r["trust"] if "trust" in r.keys() else 1.0)
+                    _cf = int(r["conflict"] if "conflict" in r.keys() else 0)
+                    if _t < 1.0:
+                        s *= (0.5 + 0.5 * max(0.0, min(1.0, _t)))
+                    if _cf == 1:
+                        s *= CONFLICT_RECALL_PENALTY
+                except Exception:
+                    pass
                 out.append((s, wn, r, sim, cover))
                 # 🔧 2026-10-30 临时排错钩子（查完就删）：把每条的实际分数留痕，
                 #    外面 _DBG_SCORES 一开就能看，不影响正常路径。
@@ -3201,6 +3514,14 @@ class MemoryCard:
             self._last_assoc_ids = {r["id"] for _s, _wn, r, _sim, _cov
                                     in hits[n_direct:]}
 
+        # 🔧 2026-11-01 MMR 重排（从 A 路线手册吸收，默认关）
+        #    问题：三条命中里前两条说的是同一件事（"白米饭"和"白饭"），
+        #    真正回答问题的那条被挤到第二。MMR 的解法不是改分数，是
+        #    "已经选过的内容，后面再像就扣分"，逼结果彼此不同。
+        #    默认 0 = 行为完全不变；WHALE_MMR=0.25 打开（越大越重相关性）。
+        if getattr(self, "mmr_lambda", 0.0) > 0 and len(hits) > 1:
+            hits = self._mmr_rerank(hits, lam=self.mmr_lambda)
+
         if access:
             # V5.0 公理 6：只写事件，不改 mem。
             # 真正的加固由 _settle_recall_events() 在 tick() 里统一做，
@@ -3216,6 +3537,38 @@ class MemoryCard:
             except Exception:
                 pass
         return [(s, wn, r) for s, wn, r, _sim, _cov in hits]
+
+    def _mmr_rerank(self, hits, lam=0.7):
+        """把"彼此太像"的结果往后挪，让前几条信息量更足。
+
+        score 已经算好了，这里只做重排，不动权重、不写任何表。
+        λ 越大越偏向原始分数；λ=1 等于不重排。
+        """
+        def toks(r):
+            try:
+                return set(to_vec(r["core"] or r["raw"] or ""))
+            except Exception:
+                return set()
+
+        cand = list(hits)
+        top = max((h[0] for h in cand), default=1.0) or 1.0
+        chosen, left = [], cand
+        while left:
+            best_i, best_v = 0, None
+            for i, h in enumerate(left):
+                rel = h[0] / top
+                red = 0.0
+                if chosen:
+                    tk = toks(h[2])
+                    for c in chosen:
+                        ck = toks(c[2])
+                        if tk or ck:
+                            red = max(red, len(tk & ck) / float(len(tk | ck)))
+                v = lam * rel - (1.0 - lam) * red
+                if best_v is None or v > best_v:
+                    best_i, best_v = i, v
+            chosen.append(left.pop(best_i))
+        return chosen
 
     def _expand_assoc(self, hits, scored, rows, vecs, now):
         """把直接命中的结果当种子，沿突触扩散出「联想记忆」

@@ -345,6 +345,8 @@ class Mind(object):
                 "synapse": syn,
                 "mood": self.card.mood_label(),
                 "hormones": hormone_mod.describe(self.card.h),
+                # PAD 三维读法（从 A 路线吸收）：只读、不改激素、不影响召回
+                "pad": self.card.mood_pad(),
                 # 睡眠结算：这次醒来睡了多久、算不算数
                 "wake": self.wake,
                 # 离线超 24 小时补的那条记忆（§11.3），没补就是 null
@@ -499,6 +501,17 @@ class Handler(BaseHTTPRequestHandler):
                 # 不碰数据库、不碰记忆 —— 纯粹是"这台机器此刻的呼吸"。
                 import console as _console
                 return self._send(200, _console.sys_live())
+            if method == "GET" and path == "/injection":
+                # 防污层：最近被灌进来的可疑念头（只读，不改任何权重）
+                with m.lock:
+                    return self._send(200, m.card.injection_report())
+            if method == "GET" and path == "/dream/pending":
+                # 梦境压缩（卡侧）：把还没消化的对话原文掏出来给外面的提炼器
+                with m.lock:
+                    return self._send(200, m.card.pending_dialogue())
+            if method == "GET" and path == "/dream/due":
+                with m.lock:
+                    return self._send(200, m.card.dream_due())
             if method == "GET" and path == "/timeline":
                 import console as _console
                 return self._send(200, {"ok": True,
@@ -593,6 +606,18 @@ class Handler(BaseHTTPRequestHandler):
                              "w_now": round(float(w), 4),
                              "text": m.card.render(r, w)}
                             for s, w, r in hits]})
+                if path == "/dream/commit":
+                    # 梦境压缩（写回）：外面提炼好的高阶记忆从这里进卡。
+                    # items: [{text, region?, salience?, w0?}]
+                    # dialogue_ids: 可选，标记哪些原文已被消化（不传=全部标记）
+                    items = body.get("items") or []
+                    if not isinstance(items, list) or not items:
+                        return self._fail(400, "empty_items", "items 不能为空")
+                    with m.lock:
+                        out = m.card.dream_commit(
+                            items, dialogue_ids=body.get("dialogue_ids"),
+                            speaker=(body.get("speaker") or "self"))
+                    return self._send(200, {"ok": True, "dream": out})
                 if path == "/emb/remodel":
                     # 换过模型的卡里有「两代向量」：老的那批维度跟当前模型
                     # 对不上，检索时会被直接丢掉 —— 但覆盖率还是报 100%。

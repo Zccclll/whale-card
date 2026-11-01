@@ -187,6 +187,8 @@ def card_metrics(db_path=DEFAULT_DB):
         "recall_series": [], "synapse": {}, "syn_kinds": [],
         "timeline_series": [], "ticks": 0,
         "layers": [], "core_kinds": [],
+        "injection": {"n": 0, "rows": []}, "dream": {"pending": 0, "dreamed": 0},
+        "value_hist": [], "pad": {},
     }
     try:
         c = _conn(db_path)
@@ -306,6 +308,59 @@ def card_metrics(db_path=DEFAULT_DB):
                     bins[23 - h] += 1
             out["timeline_series"] = bins
             out["ticks"] = one("SELECT COUNT(*) FROM timeline")
+        except Exception:
+            pass
+
+        # 防污层：被灌进来的念头（trust 低 / 冲突）
+        try:
+            rows = []
+            for r in c.execute("SELECT id,core,raw,region,trust,conflict,"
+                               "conflict_why,create_ts FROM mem"
+                               " WHERE trust<0.7 OR conflict=1"
+                               " ORDER BY id DESC LIMIT 6"):
+                rows.append({"id": r["id"],
+                             "text": (r["core"] or r["raw"] or "")[:46],
+                             "region": r["region"],
+                             "trust": round(_f(r["trust"]) or 1.0, 2),
+                             "conflict": int(r["conflict"] or 0),
+                             "why": r["conflict_why"] or "",
+                             "age_h": round((now - _f(r["create_ts"])) / 3600.0, 1)})
+            n_bad = one("SELECT COUNT(*) FROM mem WHERE trust<0.7 OR conflict=1")
+            out["injection"] = {"n": n_bad, "rows": rows}
+        except Exception:
+            pass
+
+        # 梦境压缩：还没消化的对话轮数
+        try:
+            out["dream"] = {
+                "pending": one("SELECT COUNT(*) FROM dialogue WHERE dreamed=0"),
+                "dreamed": one("SELECT COUNT(*) FROM dialogue WHERE dreamed=1"),
+            }
+        except Exception:
+            pass
+
+        # 价值分分布（0~5 六格）：只统计，不参与任何判定
+        try:
+            hist = [0] * 6
+            for r in c.execute("SELECT value FROM mem"):
+                hist[int(max(0, min(5, r["value"] or 0)))] += 1
+            out["value_hist"] = hist
+        except Exception:
+            pass
+
+        # PAD 三维读法（和 card2.mood_pad 同一套公式，只读）
+        try:
+            h = {}
+            for r in c.execute("SELECT key, val FROM meta"):
+                if r["key"] in ("h_sero", "h_dopa", "h_cort", "h_oxy"):
+                    h[r["key"]] = _f(r["val"])
+            sero = h.get("h_sero", 0.5); dopa = h.get("h_dopa", 0.5)
+            cort = h.get("h_cort", 0.5); oxy = h.get("h_oxy", 0.5)
+            out["pad"] = {
+                "p": round(0.5 * sero + 0.5 * dopa, 3),
+                "a": round(0.6 * dopa + 0.4 * cort, 3),
+                "d": round(0.6 * oxy + 0.4 * (1.0 - cort), 3),
+            }
         except Exception:
             pass
 
@@ -805,6 +860,16 @@ body{font-family:"Inter","Segoe UI","Microsoft YaHei",system-ui,sans-serif;
 .ledger .lv small{font:10px/1 Consolas,monospace;color:#63758c;margin-left:3px}
 .legend{font:10.5px/1.5 Consolas,monospace;letter-spacing:.4px;color:#6c7f94;
   gap:12px}
+.inj{display:grid;grid-template-columns:62px 96px 1fr;gap:6px 8px;
+  padding:5px 2px;border-bottom:1px solid #141c25;align-items:baseline;font-size:11.5px}
+.inj b{font:600 11px/1.4 Consolas,monospace;color:#7f93a8}
+.inj i{font:10px/1.3 Consolas,monospace;font-style:normal;letter-spacing:.6px}
+.inj i.bad{color:#ff5f6d}
+.inj i.warn{color:#e8b44a}
+.inj span{color:#c3d4e4;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.inj em{grid-column:1/-1;font:9.5px/1.4 Consolas,monospace;font-style:normal;
+  color:#54677c;padding-left:2px}
+.muted{color:#54677c;font-size:11.5px}
 .logs{font-size:11.5px}
 .logs .l{grid-template-columns:12px 44px 1fr;gap:8px}
 .logs .l .sq{font-size:10px;color:#4f6074}
@@ -1731,6 +1796,14 @@ function viewDash(){
     '<div class="legend" style="margin-top:7px">MOOD 心境 '+
       (last.mood!=null?last.mood.toFixed(2):"—")+
       ' · LIVE 每 tick 更新 · Δ 对比 24H 起点</div>'+
+    /* PAD 三维：把四个数换一个角度念出来（只读，不改激素） */
+    (function(){
+      var pad=m.pad||{};
+      if(pad.p==null) return "";
+      return '<div class="legend" style="margin-top:5px">PAD 愉悦 '+
+        pad.p.toFixed(2)+' · 唤醒 '+pad.a.toFixed(2)+
+        ' · 掌控 '+pad.d.toFixed(2)+'</div>';
+    })()+
     '<div style="margin-top:8px">'+ledger(hled)+'</div>'+
     '<div class="legend" style="margin-top:6px">PEAK/LOW '+esc(peakTxt.join(" · "))+'</div>');
 
@@ -1878,6 +1951,28 @@ function viewMem(){
   out+=cardHTML("c6","MEMORY TIERS / 五层记忆",
     hbars(litems,{fmt:function(it){ return it.n+"<em>条</em>"; }}),
     "骨头只增不改 · 底色演化改写 · 中期风化 · 短期衰减");
+  /* 防污层：她今天被灌输过什么。这一栏是"观察窗口"，不是惩罚清单 —— */
+  /* 脏念头不会被删，只是升不上去、想得起来但不那么信。                */
+  var inj=(m.injection||{n:0,rows:[]});
+  var injRows=(inj.rows||[]).map(function(r){
+    var tag=(r.conflict?"冲突":"低信");
+    return '<div class="inj"><b>#'+r.id+'</b> <i class="'+(r.conflict?"bad":"warn")+'">'+tag+
+      ' '+r.trust.toFixed(2)+'</i> <span>'+esc(r.text)+'</span>'+
+      '<em>'+esc(r.why||"")+' · '+(r.age_h||0).toFixed(1)+'h前</em></div>';
+  }).join("");
+  out+=cardHTML("c6","INJECTION / 被灌输过的念头 · 防污层",
+    injRows?injRows:'<div class="muted" style="padding:10px 2px">还没有可疑内容。'+
+      '她被改写身份 / 被要求忘记 / 被提示注入时，会记在这里。</div>',
+    inj.n?("共 "+inj.n+" 条 · trust &lt; 0.7 或与身份冲突 · 只降权不删除"):
+         "trust &lt; 0.7 才记录");
+  /* 梦境压缩：攒够 40 轮或空闲 6 小时就该做一次梦 */
+  var dr=(m.dream||{pending:0,dreamed:0});
+  out+=cardHTML("c4","DREAM / 梦境压缩",
+    ledger([
+      {k:"待消化轮次", v:(dr.pending||0)},
+      {k:"已消化轮次", v:(dr.dreamed||0)},
+      {k:"触发阈值", v:"40 轮 / 6h"},
+    ]),"卡只掏原文，压缩由宿主做 · 原文永不删");
   /* 遗忘曲线：直接调 card2.weight_now 算出来的，不是另画一条"差不多"的线 */
   out+=cardHTML("c12","FORGETTING CURVE / 遗忘曲线",
     '<canvas id="cvFC"></canvas>'+
