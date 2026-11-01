@@ -1,0 +1,6 @@
+# 运行时依赖（都很轻，没有 torch）
+numpy>=1.24
+psutil>=5.9
+
+# 可选：只有跑 tests/test_t52.py（原文归档压缩）时需要
+# zstandard>=0.22

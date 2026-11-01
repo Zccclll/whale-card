@@ -1,0 +1,34 @@
+# 自定义卡的数据库（这是隐私本身，绝不能进仓库）
+card.db
+card.db-*
+*.db
+*.db-wal
+*.db-shm
+*.db.bak*
+*.broken-*
+
+# 向量模型（几百 MB，自己下）
+models/
+
+# 运行态产物
+__pycache__/
+*.pyc
+snapshots/
+backups/
+diary/
+viz/
+demo/*.db
+demo/*.db-*
+dsh_channel_rule.txt
+avatar.png
+_*.log
+*.log
+
+# 截图里常有真实数据
+docs_*.png
+_cs*.png
+
+# 本地环境
+.venv/
+venv/
+.env
