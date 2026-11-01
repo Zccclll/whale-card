@@ -505,6 +505,40 @@ class Handler(BaseHTTPRequestHandler):
                 # 防污层：最近被灌进来的可疑念头（只读，不改任何权重）
                 with m.lock:
                     return self._send(200, m.card.injection_report())
+            if method == "GET" and path.startswith("/media/"):
+                # 出一帧画面。找不到 / 已被按规则删掉，返回 410 而不是 404 ——
+                # 「曾经有，现在没了」和「从来就没有」是两件事，不能混成一个错。
+                sha = path[len("/media/"):].strip().lower()
+                if len(sha) != 64 or not all(ch in "0123456789abcdef" for ch in sha):
+                    return self._fail(400, "bad_sha256", "要 64 位十六进制")
+                with m.lock:
+                    row = m.card.db.execute(
+                        "SELECT path, thumb, mime FROM media WHERE sha256=?",
+                        (sha,)).fetchone()
+                    if row is None:
+                        tomb = m.card.db.execute(
+                            "SELECT caption, ts, reason FROM media_tomb WHERE sha256=?",
+                            (sha,)).fetchone()
+                        if tomb is not None:
+                            return self._fail(
+                                410, "media_dropped",
+                                "这张画面 %s 按规则忘了（%s）。当时写的是：%s"
+                                % (time.strftime("%Y-%m-%d %H:%M",
+                                                 time.localtime(tomb["ts"])),
+                                   tomb["reason"], tomb["caption"] or "—"))
+                        return self._fail(404, "no_media", "没有这张画面")
+                    rel = row["path"] or ""
+                p = rel if os.path.isabs(rel) else os.path.join(m.card.card_dir, rel)
+                if not os.path.exists(p):
+                    return self._fail(410, "media_gone", "记录还在，文件没了")
+                raw = open(p, "rb").read()
+                self.send_response(200)
+                self.send_header("Content-Type", row["mime"] or "image/webp")
+                self.send_header("Content-Length", str(len(raw)))
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                self.wfile.write(raw)
+                return None
             if method == "GET" and path == "/dream/pending":
                 # 梦境压缩（卡侧）：把还没消化的对话原文掏出来给外面的提炼器
                 with m.lock:

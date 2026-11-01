@@ -348,6 +348,19 @@ def card_metrics(db_path=DEFAULT_DB):
         except Exception:
             pass
 
+        # 画面记忆：多少帧、占多大、多少在残影期、删过几张（两条曲线另外画）
+        try:
+            out["media"] = {
+                "n": one("SELECT COUNT(*) FROM media"),
+                "mb": round((c.execute("SELECT COALESCE(SUM(bytes),0) FROM media"
+                                       ).fetchone()[0] or 0) / 1048576.0, 2),
+                "orphan": one("SELECT COUNT(*) FROM media WHERE orphan_ts>0"),
+                "pinned": one("SELECT COUNT(*) FROM media WHERE pinned=1"),
+                "tomb": one("SELECT COUNT(*) FROM media_tomb"),
+            }
+        except Exception:
+            out["media"] = {"n": 0, "mb": 0, "orphan": 0, "pinned": 0, "tomb": 0}
+
         # 价值分分布（0~5 六格）：只统计，不参与任何判定
         try:
             hist = [0] * 6
@@ -518,6 +531,25 @@ def forget_curve(db_path=DEFAULT_DB):
     return out
 
 
+def media_curve(db_path=DEFAULT_DB):
+    """画面自己的那条曲线：跟文字并排画，才看得出「先忘样子、后忘事件」。
+
+    同样不另写公式 —— 调 card2.media_weight_now，和 tick 里删帧用的是同一个函数。
+    """
+    import card2
+    now = time.time()
+    days = [0, 1, 2, 3, 5, 7, 10, 14, 21, 30, 45, 60, 90, 120, 180, 270, 371, 540]
+    img = []
+    for d in days:
+        img.append(round(card2.media_weight_now(
+            1.0, now - d * 86400.0, now), 4))
+    return {"days": days, "image": img,
+            "drop_w": card2.MEDIA_DROP_W,
+            "b": card2.MEDIA_DECAY_B,
+            "tau_days": card2.MEDIA_TAU_DAYS,
+            "text_mid": forget_curve(db_path)["mid"]}
+
+
 # ── 实时系统指标（CPU / 内存 / 磁盘读写 / 网络）─────────────────────
 # 放在控制台这一侧：这些数字跟卡没关系，就是"这台机器此刻的呼吸"。
 # psutil 采一次只要几毫秒，2 秒一次对算力几乎没影响。
@@ -604,6 +636,11 @@ def overview(db_path=DEFAULT_DB):
         "mem_by_day": mem_by_day(db_path),
         "regions": regions(db_path),
         "storage": storage(db_path),
+        # 两条遗忘曲线并排给前端（文字 vs 画面），公式都来自卡本身，控制台不另写一份
+        "curves": (lambda: {
+            "forget": forget_curve(db_path),
+            "media": media_curve(db_path),
+        })(),
         "health": health_flag(db_path),
         "pools": pools,
         "metrics": card_metrics(db_path),
@@ -723,6 +760,7 @@ nav .stamp{color:var(--dim2);font-size:11.5px;font-variant-numeric:tabular-nums}
 #neb{height:520px;min-height:0;flex:0 0 520px}
 #cvTT,#cvTK,#cvMW,#cvMWr,#cvMS{min-height:170px}
 #cvFC{min-height:230px}
+#cvMD{min-height:210px}
 #cvSrc,#cvR,#cvRadar,#cvSyn,#cvWH,#cvRec{min-height:200px}
 #cvH,#cvPad{min-height:150px}
 #cvSys{min-height:190px}
@@ -1085,6 +1123,51 @@ function barChart(cv, items, color, h){
 }
 /* 遗忘曲线：横轴天数（对数），四条线分别是短期/中期/长期/底色。
    数据来自后端 forget_curve()，那个是直接调 card2.weight_now 算的。 */
+function drawMediaCurve(cv, md){
+  /* 两条寿命并排：画面（幂律，掉得快）vs 文字（慢得多）。
+     公式都从卡那边来，这里只负责画 —— 不另写一条"差不多"的线。 */
+  var days=md.days||[], img=md.image||[], txt=md.text_mid||[];
+  var f=fitCanvas(cv,230), g=f.g, W=f.w, H=f.h;
+  var padL=44, padR=14, padT=12, padB=26;
+  var iw=W-padL-padR, ih=H-padT-padB;
+  g.clearRect(0,0,W,H);
+  if(!days.length){ g.fillStyle="#4a5a6d"; g.font="10px Consolas,monospace";
+    g.fillText("还没有画面", padL+6, padT+ih/2); return; }
+  g.strokeStyle="#161f29"; g.lineWidth=1;
+  g.font="9.5px Consolas,monospace"; g.fillStyle="#4a5a6d";
+  for(var k=0;k<=4;k++){
+    var y=padT+ih*k/4;
+    g.beginPath(); g.moveTo(padL,y); g.lineTo(W-padR,y); g.stroke();
+    g.fillText((1-k/4).toFixed(2), 2, y+3);
+  }
+  var dmax=Math.log(1+days[days.length-1]);
+  var X=function(d){ return padL+iw*Math.log(1+d)/dmax; };
+  var Y=function(v){ return padT+ih*(1-Math.max(0,Math.min(1,v))); };
+  [0,1,7,30,90,180,371,540].forEach(function(d){
+    if(d>days[days.length-1]) return;
+    var x=X(d);
+    g.strokeStyle="#131a22"; g.beginPath(); g.moveTo(x,padT); g.lineTo(x,padT+ih); g.stroke();
+    g.fillStyle="#4a5a6d"; g.textAlign="center";
+    g.fillText(d?(d+"d"):"0", x, H-9); g.textAlign="left";
+  });
+  /* 删除线：画面掉到这条线以下就删文件，此后永远调不出来 */
+  var drop=(md.drop_w==null?0.10:md.drop_w);
+  var yd=Y(drop);
+  g.save(); g.setLineDash([5,4]); g.strokeStyle="#ff5f6d"; g.globalAlpha=.7;
+  g.beginPath(); g.moveTo(padL,yd); g.lineTo(W-padR,yd); g.stroke(); g.restore();
+  g.fillStyle="#b4565f"; g.font="9px Consolas,monospace";
+  g.fillText("删除线 "+drop.toFixed(2), padL+6, yd-4);
+  [[img,"#e8b44a",2.0],[txt,"#2fd07d",1.6]].forEach(function(sp){
+    var vals=sp[0]||[]; if(!vals.length) return;
+    g.beginPath();
+    for(var i=0;i<days.length;i++){
+      var x=X(days[i]), y=Y(vals[i]);
+      if(i===0) g.moveTo(x,y); else g.lineTo(x,y);
+    }
+    g.strokeStyle=sp[1]; g.lineWidth=sp[2]; g.stroke();
+  });
+}
+
 function drawForget(cv, fc){
   var days=fc.days||[], f=fitCanvas(cv,240), g=f.g, W=f.w, H=f.h;
   var padL=44, padR=14, padT=12, padB=26;
@@ -2004,6 +2087,18 @@ function viewMem(){
       '<span><i style="background:#e8b44a"></i>底色 core（不衰减）</span>'+
     '</div>',
     "从权重 1.0 开始 · 横轴天（对数）· 竖轴剩余权重");
+  /* 画面记忆：两条曲线并排 —— 先忘样子，后忘事件 */
+  var md=(m.media||{n:0,mb:0,orphan:0,pinned:0,tomb:0});
+  out+=cardHTML("c12","MEDIA MEMORY / 画面记忆 · 两条寿命",
+    '<canvas id="cvMD"></canvas>'+
+    '<div class="legend">'+
+      '<span><i style="background:#e8b44a"></i>画面 image（幂律 b=0.55）</span>'+
+      '<span><i style="background:#2fd07d"></i>文字 mid（慢得多）</span>'+
+      '<span><i style="background:#ff5f6d"></i>画面删除线 0.10</span>'+
+    '</div>',
+    (md.n||0)+" 帧 · "+(md.mb||0).toFixed(2)+" MB · 残影 "+(md.orphan||0)+
+      " · 锁 "+(md.pinned||0)+" · 删过 "+(md.tomb||0)+
+      " ｜ 只剩关键帧和那句话，不存原图原视频");
   out+=cardHTML("c6","REGION MIX / 分区明细",
     '<div class="bars">'+regs.map(function(r){
       return bar2(RN[r.r]||r.r, r.n, rmax, RC[r.r]||"#5b7fa6"); }).join('')+'</div>'+
@@ -2459,7 +2554,9 @@ function draw(){
         String(m.recall_24h||0));
     }
     var cfc=$("#cvFC");
-    if(cfc) drawForget(cfc, d.forget||{});
+    if(cfc) drawForget(cfc, (d.curves||{}).forget||{});
+    var cmd=$("#cvMD");
+    if(cmd) drawMediaCurve(cmd, (d.curves||{}).media||{});
     var go=$("#qGo");
     if(go && !go._bound){
       go._bound=1;

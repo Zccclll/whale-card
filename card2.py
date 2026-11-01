@@ -126,6 +126,39 @@ ERASE_STAGE_OBJ = 2    # 已擦掉宾语
 # 否则权重已经贴着 GC 线，擦完下一步就被回收，用户永远看不到残缺渲染。
 HUSK_W = 0.015
 
+# --- 媒体记忆（画面）：2026-11-02，设计见 docs/MEDIA-MEMORY.md ---
+# 文字是主干，画面是快照：**两条寿命，各自风化**，只用索引相连，寿命不互传。
+# 形状用幂律而不是指数——艾宾浩斯 1885 那组数据（20 分 58.2% / 1 天 33.7% /
+# 31 天 21.1%）和后来对数百个数据集的拟合（Wixted & Ebbesen 1997）都指向
+# R = a(t+δ)^(-b)：先掉得猛，然后拖着一条长尾。指数衰减会"到点归零"，与数据不符。
+MEDIA_DIR = "media"            # 卡目录下的媒体子目录（卡本体不含 blob）
+MEDIA_DECAY_B = 0.55           # 幂律指数：越大掉得越快
+MEDIA_TAU_DAYS = 1.0           # 时间尺度 τ（天）
+MEDIA_DROP_W = 0.10            # 低于它删帧。落在约 65 天"没见过一次"的图
+MEDIA_GAIN_MULT = 1.45         # 看一眼的乘法增益（文字是 +0.08 加法，画面更猛）
+MEDIA_GAIN_ADD = 0.10
+MEDIA_ORPHAN_DAYS = 30.0       # 文字先没了、图还在时的"残影期"
+MEDIA_CAP_MB = 10240           # 硬上限 10 GB（软提醒 5 GB 在控制台）
+MEDIA_IMG_MAX_EDGE = 800       # 存的长边像素（不存原图，细节永久损失，这是明说的取舍）
+MEDIA_THUMB_EDGE = 96          # 控制台网格用缩略图
+MEDIA_MAX_FRAMES = 6           # 一段视频最多抽几帧
+
+
+def media_weight_now(w0, t_anchor, now, pinned=0):
+    """画面权重：幂律，不是指数（模块级，控制台画曲线也要用同一个函数）。
+
+    w(t) = w0 · (1 + t/τ)^(-b)，τ=1 天、b=0.55
+    单图（w0=1）：1 天 .68 / 7 天 .32 / 30 天 .15 / 60 天 .10 —— 到 0.10 就删。
+    幂律有长尾，符合"很久以后突然想起来"；指数会到点归零，与艾宾浩斯数据不符。
+    """
+    if pinned:
+        return 1.0
+    age = max(0.0, float(now) - float(t_anchor or 0)) / DAY
+    try:
+        return float(w0) * (1.0 + age / MEDIA_TAU_DAYS) ** (-MEDIA_DECAY_B)
+    except Exception:
+        return float(w0 or 0.0)
+
 # 轻量动词词典（不做完整句法分析，够用就行）
 VERB_WORDS = [
     "吃", "喝", "买", "卖", "去", "来", "回", "走", "跑", "坐", "站", "躺",
@@ -1898,6 +1931,57 @@ class MemoryCard:
             reason TEXT NOT NULL DEFAULT ''
         )""")
 
+        # 媒体记忆（2026-11-02）：画面自己一条寿命，文件放 media/ 目录，库里只放元数据。
+        # 一条帧可以被多条记忆引用（同一张烧烤摊照片可能同时属于三条记忆），
+        # 所以引用单独一张表，删的时候按引用计数走。
+        c.execute("""
+        CREATE TABLE IF NOT EXISTS media (
+            id             INTEGER PRIMARY KEY AUTOINCREMENT,
+            sha256         TEXT NOT NULL UNIQUE,
+            kind           TEXT NOT NULL DEFAULT 'image',
+            mime           TEXT NOT NULL DEFAULT 'image/webp',
+            w              INTEGER NOT NULL DEFAULT 0,
+            h              INTEGER NOT NULL DEFAULT 0,
+            dur            REAL NOT NULL DEFAULT 0,
+            bytes          INTEGER NOT NULL DEFAULT 0,
+            path           TEXT NOT NULL DEFAULT '',
+            thumb          TEXT NOT NULL DEFAULT '',
+            caption        TEXT NOT NULL DEFAULT '',
+            tags           TEXT NOT NULL DEFAULT '[]',
+            t0             REAL,
+            t1             REAL,
+            dialogue_id    INTEGER,
+            source         TEXT NOT NULL DEFAULT 'user',
+            trust          REAL NOT NULL DEFAULT 1.0,
+            w0             REAL NOT NULL DEFAULT 2.0,
+            t_anchor       REAL NOT NULL DEFAULT 0,
+            recall_n       INTEGER NOT NULL DEFAULT 0,
+            t_last_recall  REAL NOT NULL DEFAULT 0,
+            pinned         INTEGER NOT NULL DEFAULT 0,
+            orphan_ts      REAL NOT NULL DEFAULT 0,
+            birth_hash     TEXT NOT NULL DEFAULT '',
+            ts             REAL NOT NULL DEFAULT 0
+        )""")
+        c.execute("CREATE INDEX IF NOT EXISTS ix_media_anchor ON media(t_anchor)")
+        c.execute("""
+        CREATE TABLE IF NOT EXISTS media_ref (
+            mem_id   INTEGER NOT NULL,
+            media_id INTEGER NOT NULL,
+            ts       REAL NOT NULL DEFAULT 0,
+            PRIMARY KEY (mem_id, media_id)
+        )""")
+        c.execute("CREATE INDEX IF NOT EXISTS ix_media_ref_m ON media_ref(media_id)")
+        # 删帧台账：文件真没了，但得能证明"是我按规则删的"，不是被人抽走。
+        # 跟 mem_tomb 一个道理，caption 也留一份 —— 忘了内容，记得忘过。
+        c.execute("""
+        CREATE TABLE IF NOT EXISTS media_tomb (
+            sha256 TEXT PRIMARY KEY,
+            caption TEXT NOT NULL DEFAULT '',
+            ts     REAL NOT NULL DEFAULT 0,
+            reason TEXT NOT NULL DEFAULT '',
+            weight_at_drop REAL NOT NULL DEFAULT 0
+        )""")
+
         # 控制台要有「趋势」才看得出变化 —— 光有当前值只能画一个点。
         # 每 5 分钟采一次样，一行 ~60 字节，一天 288 行，一年 10 万行 ≈ 6 MB。
         # 只存数，不存解释；解释永远现算。
@@ -2385,6 +2469,14 @@ class MemoryCard:
         except Exception:
             pass
 
+        # 画面自己风化（幂律，比文字快得多）：到线删文件、留台账，文字那条不动。
+        # 跟技能的 tick 一样，出错不许拖垮整轮结算。
+        try:
+            for _mid, _kind, _tag in self._media_tick(now):
+                events.append((0, "media_" + _kind, _tag))
+        except Exception:
+            pass
+
         self.db.commit()
         self._gc()
         if verbose:
@@ -2541,6 +2633,21 @@ class MemoryCard:
         都在档案上留一笔。reason 是给人看的，别写代码黑话。
         """
         self._tomb_add(c, mid, reason)
+        # 画面跟着记忆走：先断开引用；如果这帧再没人引用，就从"有主"变成"残影"。
+        # 不在这里直接删帧 —— 残影期是留给"还想再看一眼"的窗口。
+        try:
+            med = [r[0] for r in c.execute(
+                "SELECT media_id FROM media_ref WHERE mem_id=?", (int(mid),)).fetchall()]
+            c.execute("DELETE FROM media_ref WHERE mem_id=?", (int(mid),))
+            now = self.clock.now()
+            for m_id in med:
+                left = c.execute("SELECT COUNT(*) FROM media_ref WHERE media_id=?",
+                                 (m_id,)).fetchone()[0]
+                if left == 0:
+                    c.execute("UPDATE media SET orphan_ts=? WHERE id=? AND orphan_ts=0",
+                              (now, m_id))
+        except Exception:
+            pass
         c.execute("DELETE FROM detail WHERE parent_id=?", (mid,))
         c.execute("DELETE FROM mem WHERE id=?", (mid,))
 
@@ -2565,6 +2672,220 @@ class MemoryCard:
                 " VALUES(?,?,?,?)", (int(mid), h, time.time(), reason))
         except Exception:
             pass
+
+    # ---------- 媒体记忆（画面）：设计见 docs/MEDIA-MEMORY.md ----------
+    # 一段画面自己一条寿命，跟文字那条**不互传**：文字掉到多低都不影响画面，
+    # 反之亦然。两条只在索引上相连（想到那句话，知道还有张图）。
+    def media_root(self):
+        """媒体目录（卡目录下的 media/）。卡本体不含 blob —— 卡要能整个拷走。"""
+        p = os.path.join(self.card_dir, MEDIA_DIR)
+        try:
+            os.makedirs(p, exist_ok=True)
+        except Exception:
+            pass
+        return p
+
+    def media_weight_now(self, w0, t_anchor, now=None, pinned=0):
+        """画面权重（薄封装）：公式在模块级那一份，控制台画曲线共用，免得两份分家。"""
+        now = self.clock.now() if now is None else now
+        return media_weight_now(w0, t_anchor, now, pinned)
+
+    def attach_media(self, mem_id, sha256, caption="", tags=None, kind="image",
+                     mime="image/webp", path="", thumb="", w=0, h=0, dur=0.0,
+                     nbytes=0, t0=None, t1=None, dialogue_id=None,
+                     source="user", trust=1.0, w0=1.0, pinned=0):
+        """把一帧画面挂到一条记忆上。
+
+        同一个文件（sha256 相同）只存一份，多条记忆共享 —— 所以删记忆时
+        要看引用计数，不能删一条就把图带走。
+        """
+        c = self.db.cursor()
+        row = c.execute("SELECT id FROM mem WHERE id=?", (int(mem_id),)).fetchone()
+        if row is None:
+            return {"ok": False, "reason": "no_such_mem"}
+        sha = (sha256 or "").strip().lower()
+        if len(sha) != 64:
+            return {"ok": False, "reason": "bad_sha256"}
+        # 容量硬上限：宁可少收一张，也别把盘塞满
+        try:
+            used = c.execute("SELECT COALESCE(SUM(bytes),0) FROM media").fetchone()[0]
+            if nbytes and used + int(nbytes) > MEDIA_CAP_MB * 1024 * 1024:
+                return {"ok": False, "reason": "cap_exceeded"}
+        except Exception:
+            pass
+        now = self.clock.now()
+        exists = c.execute("SELECT * FROM media WHERE sha256=?", (sha,)).fetchone()
+        if exists is None:
+            tags_json = json.dumps(tags or [], ensure_ascii=False)
+            try:
+                bh = hashlib.sha256(
+                    (sha + "|" + caption + "|" + kind).encode("utf-8")).hexdigest()
+            except Exception:
+                bh = ""
+            c.execute(
+                "INSERT INTO media(sha256,kind,mime,w,h,dur,bytes,path,thumb,caption,"
+                "tags,t0,t1,dialogue_id,source,trust,w0,t_anchor,pinned,birth_hash,ts)"
+                " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (sha, kind, mime, int(w), int(h), float(dur or 0), int(nbytes or 0),
+                 path or "", thumb or "", caption or "", tags_json,
+                 t0, t1, dialogue_id, source, float(trust), float(w0), now,
+                 int(pinned or 0), bh, now))
+            mid_media = c.execute("SELECT id FROM media WHERE sha256=?", (sha,)).fetchone()[0]
+        else:
+            mid_media = exists["id"]
+            # 又见面了：把 caption 补上（原来空的才补，不覆盖已有的），权重不重置
+            if caption and not exists["caption"]:
+                c.execute("UPDATE media SET caption=? WHERE id=?", (caption, mid_media))
+            c.execute("UPDATE media SET pinned=? WHERE id=? AND ?=1",
+                      (1, mid_media, int(pinned or 0)))
+        c.execute("INSERT OR REPLACE INTO media_ref(mem_id,media_id,ts) VALUES(?,?,?)",
+                  (int(mem_id), int(mid_media), now))
+        # 有引用了就不是孤儿
+        c.execute("UPDATE media SET orphan_ts=0 WHERE id=?", (int(mid_media),))
+        self.db.commit()
+        return {"ok": True, "media_id": int(mid_media), "dup": exists is not None}
+
+    def media_of(self, mem_id, now=None):
+        """这条记忆身上还有哪些画面（含状态与当前权重）。"""
+        now = self.clock.now() if now is None else now
+        c = self.db.cursor()
+        out = []
+        rows = c.execute(
+            "SELECT m.* FROM media m JOIN media_ref r ON r.media_id=m.id"
+            " WHERE r.mem_id=? ORDER BY m.id", (int(mem_id),)).fetchall()
+        for r in rows:
+            wv = self.media_weight_now(r["w0"], r["t_anchor"], now, r["pinned"])
+            out.append({
+                "id": r["id"], "sha256": r["sha256"], "caption": r["caption"],
+                "kind": r["kind"], "tags": json.loads(r["tags"] or "[]"),
+                "w": round(wv, 4), "pinned": bool(r["pinned"]),
+                "orphan": bool(r["orphan_ts"]),
+                "alive": wv >= MEDIA_DROP_W or bool(r["pinned"]),
+                "recall_n": r["recall_n"], "w": round(wv, 4),
+            })
+        return out
+
+    def media_touch(self, media_id, now=None):
+        """看一眼：加强 + 重置计时。画面靠"被翻出来"活着。
+
+        w ← min(1.0, w×1.45 + 0.10)。比文字猛（文字是 +0.08 加法），
+        因为画面没有别的维持途径：常看就记得牢，不看就真的没了。
+        """
+        now = self.clock.now() if now is None else now
+        c = self.db.cursor()
+        r = c.execute("SELECT * FROM media WHERE id=?", (int(media_id),)).fetchone()
+        if r is None:
+            return {"ok": False, "reason": "no_such_media"}
+        wv = self.media_weight_now(r["w0"], r["t_anchor"], now, 0)
+        new = min(1.0, wv * MEDIA_GAIN_MULT + MEDIA_GAIN_ADD)
+        c.execute("UPDATE media SET w0=?, t_anchor=?, recall_n=COALESCE(recall_n,0)+1,"
+                  " t_last_recall=?, orphan_ts=0 WHERE id=?",
+                  (new, now, now, int(media_id)))
+        self.db.commit()
+        return {"ok": True, "w": round(new, 4), "before": round(wv, 4)}
+
+    def _media_tomb_add(self, c, sha256, caption, reason, weight=0.0, ts=None):
+        try:
+            c.execute("INSERT OR REPLACE INTO media_tomb(sha256,caption,ts,reason,"
+                      "weight_at_drop) VALUES(?,?,?,?,?)",
+                      (sha256, caption or "", ts or time.time(), reason, float(weight or 0)))
+        except Exception:
+            pass
+
+    def _forget_media(self, c, media_id, reason, now=None, weight=0.0):
+        """删一帧的**唯一出口**：先记台账（含当时那句话），再删文件、删引用、删行。
+
+        留 caption 是有用的：以后能答"那张画面 11 月 20 号忘了，当时写的是
+        「路边摊吃烧烤」" —— 忘了内容，但记得忘过。
+        """
+        r = c.execute("SELECT * FROM media WHERE id=?", (int(media_id),)).fetchone()
+        if r is None:
+            return False
+        self._media_tomb_add(c, r["sha256"], r["caption"], reason, weight, now)
+        for rel in (r["path"], r["thumb"]):
+            if not rel:
+                continue
+            try:
+                p = rel if os.path.isabs(rel) else os.path.join(self.card_dir, rel)
+                if os.path.exists(p):
+                    os.remove(p)
+            except Exception:
+                pass
+        c.execute("DELETE FROM media_ref WHERE media_id=?", (int(media_id),))
+        c.execute("DELETE FROM media WHERE id=?", (int(media_id),))
+        return True
+
+    def _media_tick(self, now=None):
+        """挂进 tick：画面自己风化。到线删文件，文字那条一点不动。"""
+        now = self.clock.now() if now is None else now
+        c = self.db.cursor()
+        events = []
+        for r in c.execute("SELECT * FROM media").fetchall():
+            if r["pinned"]:
+                continue
+            n_ref = c.execute("SELECT COUNT(*) FROM media_ref WHERE media_id=?",
+                              (r["id"],)).fetchone()[0]
+            if n_ref == 0:
+                # 文字先没了 → 进残影期（还能被打开救回，过期才删）
+                if not r["orphan_ts"]:
+                    c.execute("UPDATE media SET orphan_ts=? WHERE id=?", (now, r["id"]))
+                    r = c.execute("SELECT * FROM media WHERE id=?", (r["id"],)).fetchone()
+                age_d = max(0.0, now - float(r["orphan_ts"] or now)) / DAY
+                if age_d > MEDIA_ORPHAN_DAYS:
+                    self._forget_media(c, r["id"], "残影期到（文字早就忘了它）",
+                                       now, r["w0"])
+                    events.append((r["id"], "orphan_expired", r["sha256"][:8]))
+                    continue
+            wv = self.media_weight_now(r["w0"], r["t_anchor"], now, 0)
+            if wv < MEDIA_DROP_W:
+                days = int(max(0.0, now - float(r["t_anchor"] or now)) / DAY)
+                self._forget_media(c, r["id"],
+                                   "画面权重到线（%d 天没再翻过）" % days, now, wv)
+                events.append((r["id"], "dropped", r["sha256"][:8]))
+        self.db.commit()
+        return events
+
+    def verify_media(self):
+        """媒体校验：分得清「按规则删了」和「被人拿走了」。"""
+        c = self.db.cursor()
+        bad = []
+        alive = 0
+        for r in c.execute("SELECT * FROM media").fetchall():
+            alive += 1
+            rel = r["path"] or ""
+            if not rel:
+                continue
+            p = rel if os.path.isabs(rel) else os.path.join(self.card_dir, rel)
+            if not os.path.exists(p):
+                bad.append("帧文件不见了：id=%d sha=%s（台账里也没有）"
+                           % (r["id"], (r["sha256"] or "")[:12]))
+        tombs = c.execute("SELECT COUNT(*) FROM media_tomb").fetchone()[0]
+        known = []
+        for t in c.execute("SELECT * FROM media_tomb ORDER BY ts DESC LIMIT 8").fetchall():
+            known.append({"sha256": (t["sha256"] or "")[:12], "caption": t["caption"],
+                          "reason": t["reason"], "ts": t["ts"]})
+        return {"ok": not bad, "alive": alive, "bad": bad,
+                "tomb_n": tombs, "known_drops": known}
+
+    def media_stats(self):
+        """控制台要的数：多少帧、占多大、多少在残影期、双曲线的两套参数。"""
+        c = self.db.cursor()
+        now = self.clock.now()
+        n = c.execute("SELECT COUNT(*) FROM media").fetchone()[0]
+        used = c.execute("SELECT COALESCE(SUM(bytes),0) FROM media").fetchone()[0]
+        orphan = c.execute("SELECT COUNT(*) FROM media WHERE orphan_ts>0").fetchone()[0]
+        tomb = c.execute("SELECT COUNT(*) FROM media_tomb").fetchone()[0]
+        pinned = c.execute("SELECT COUNT(*) FROM media WHERE pinned=1").fetchone()[0]
+        wsum = 0.0
+        for r in c.execute("SELECT w0,t_anchor,pinned FROM media").fetchall():
+            wsum += self.media_weight_now(r["w0"], r["t_anchor"], now, r["pinned"])
+        return {"n": n, "bytes": used, "mb": round(used / 1048576.0, 2),
+                "orphan": orphan, "tomb": tomb, "pinned": pinned,
+                "avg_w": round(wsum / n, 3) if n else 0.0,
+                "cap_mb": MEDIA_CAP_MB,
+                "decay": {"b": MEDIA_DECAY_B, "tau_days": MEDIA_TAU_DAYS,
+                          "drop_w": MEDIA_DROP_W, "orphan_days": MEDIA_ORPHAN_DAYS,
+                          "gain_mult": MEDIA_GAIN_MULT, "gain_add": MEDIA_GAIN_ADD}}
 
     def _gc(self):
         now = self.clock.now()
