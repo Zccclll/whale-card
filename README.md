@@ -240,14 +240,15 @@ MIT。拿去改、拿去用、拿去做产品都行，保留版权声明即可�
   year         = {2026},
   publisher    = {Zenodo},
   version      = {v1.0.0},
-  doi          = {10.5281/zenodo.23857786},
-  url          = {https://doi.org/10.5281/zenodo.23857786}
+  doi          = {10.5281/zenodo.23857785},
+  url          = {https://doi.org/10.5281/zenodo.23857785}
 }
 ```
 
-> wangjunhan131. (2026). *SYNAPSE-1024: 面向数字生命的仿生可移植心智开源架构（V5.0 实现）* (v1.0.0) [Computer software]. Zenodo. https://doi.org/10.5281/zenodo.23857786
+> wangjunhan131. (2026). *SYNAPSE-1024: 面向数字生命的仿生可移植心智开源架构（V5.0 实现）* (v1.0.0) [Computer software]. Zenodo. https://doi.org/10.5281/zenodo.23857785
 
 - 概念 DOI（所有版本）：[10.5281/zenodo.23857785](https://doi.org/10.5281/zenodo.23857785)
-- 本版 DOI（v1.0.0）：[10.5281/zenodo.23857786](https://doi.org/10.5281/zenodo.23857786)
-- Zenodo 记录：https://zenodo.org/records/23857786
+- 首版 DOI：[10.5281/zenodo.23857786](https://doi.org/10.5281/zenodo.23857786)
+- 含技术报告 PDF 的版本 DOI：[10.5281/zenodo.23857855](https://doi.org/10.5281/zenodo.23857855)
+- Zenodo 记录（含 PDF）：https://zenodo.org/records/23857855
 - GitHub 发布页：https://github.com/wangjunhan131/whale-card/releases/tag/v1.0.0
