@@ -11,6 +11,8 @@ card.db-*
 models/
 
 # 运行态产物
+anchor.json
+anchor.*.json
 __pycache__/
 *.pyc
 snapshots/
