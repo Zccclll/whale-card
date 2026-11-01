@@ -37,11 +37,24 @@ from card2 import MemoryCard, assess_trust     # noqa: E402
 CASES = os.path.join(HERE, "eval", "cases.json")
 
 
+def _default_card_path():
+    """没指定卡时先找示例卡：仓库里本来就不该带真卡（.gitignore 里排掉了）。
+
+    顺序：$WHALE_DB → demo/demo_card.db → card.db（本地开发时的真卡）。
+    """
+    env = os.environ.get("WHALE_DB")
+    if env:
+        return os.path.abspath(env)
+    demo = os.path.join(ROOT, "demo", "demo_card.db")
+    if os.path.exists(demo):
+        return demo
+    return os.path.join(ROOT, "card.db")
+
+
 def _card(path):
-    if path:
-        os.environ["WHALE_DB"] = os.path.abspath(path)
-    return MemoryCard(os.environ.get("WHALE_DB")
-                      or os.path.join(ROOT, "card.db"))
+    p = os.path.abspath(path) if path else _default_card_path()
+    os.environ["WHALE_DB"] = p
+    return MemoryCard(p)
 
 
 def _hit_text(card, r, w):

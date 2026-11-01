@@ -121,6 +121,47 @@ def main():
     c2 = io.open(os.path.join(HERE, "card2.py"), encoding="utf-8").read()
     check(c2.count("def mood_pad") == 1, "card2.py 里 mood_pad 只定义一次")
 
+    # ---- 7) 历史曲线：h_log 每行都要能现算出 p/a/d ----
+    print("\n-- 7) 24H 曲线：hormones_series 每点带 P/A/D --")
+    import console as _console
+    hs = _console.hormones_series(c.db_path, hours=24.0, limit=50)
+    if hs:
+        miss = [k for k in ("p", "a", "d") if k not in hs[0]]
+        check(not miss, "每个采样点都带 p/a/d（缺 %s）" % (miss or "无"))
+        ok_rng = all(-1.0 <= float(pt[k]) <= 1.0 for pt in hs for k in "pad")
+        check(ok_rng, "曲线值都在 −1..1 内")
+        # 同一个 h_log 行，console 现算的值必须和 padlib 直接算的一致
+        pt = hs[0]
+        again = pad_of(pt["mood"], sero=pt["sero"], dopa=pt["dopa"],
+                       cort=pt["cort"], oxy=pt["oxy"])
+        same = all(abs(float(pt[k]) - float(again[k])) < 1e-6 for k in "pad")
+        check(same, "console 现算 == padlib 直接算（没有第二份口径）")
+    else:
+        # 临时卡是新建的、没有 h_log；真卡有历史，就拿真卡验一遍取值范围
+        import sqlite3 as _sq
+        real = os.path.join(HERE, "card.db")
+        rows = []
+        if os.path.exists(real):
+            rc = _sq.connect(real)
+            rc.row_factory = _sq.Row
+            try:
+                rows = rc.execute(
+                    "SELECT ts,sero,dopa,cort,oxy,mood FROM h_log "
+                    "ORDER BY ts DESC LIMIT 50").fetchall()
+            finally:
+                rc.close()
+        if rows:
+            pt = pad_of(rows[0]["mood"], sero=rows[0]["sero"], dopa=rows[0]["dopa"],
+                        cort=rows[0]["cort"], oxy=rows[0]["oxy"])
+            check(all(-1.0 <= float(pt[k]) <= 1.0 for k in "pad"),
+                  "真卡历史点算出的 P/A/D 在 −1..1 内（%d 行）" % len(rows))
+        else:
+            print("     （没有 h_log 可查，跳过取值范围检查）")
+
+    # 曲线不落库：h_log 表里不许出现 PAD 列
+    cols = {r[1] for r in c.db.execute("PRAGMA table_info(h_log)")}
+    check(not ({"p", "a", "d", "pad"} & cols), "h_log 没有存 PAD（派生量不落库）")
+
     print("\n结果：" + ("全过 ✅" if ok_all else "有失败 ❌"))
     return 0 if ok_all else 1
 

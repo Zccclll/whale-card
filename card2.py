@@ -44,6 +44,7 @@ for _v in ('OPENBLAS_NUM_THREADS', 'OMP_NUM_THREADS', 'MKL_NUM_THREADS',
     os.environ[_v] = '1'
 
 import hormone
+import padlib
 import ctxweight
 import skill
 import identity
@@ -595,70 +596,23 @@ def mood_text(mood):
 
 # ---------------------------------------------------------------------------
 # PAD 三维情绪（2026-11-01 第二版）
-#   P 愉悦：由心境给（心境是事件推出来的慢量，最适合当"高不高兴"）
-#   A 唤醒：多巴胺 + 皮质醇，相对基线 —— 高=绷着、低=没劲
-#   D 掌控：催产素 + 少压力，相对基线 —— 高=自在、低=发怵
-# 为什么要 A：心境只有一维，说不出"低落但平静"和"低落又紧绷"的区别。
-# 为什么相对基线：基线=平静=0，负数才表示"比平时还低"。
-# 这两条是这套东西唯一的价值；改公式前先想清楚这一点。
+#   公式不住在这里 —— 它住 padlib.py（纯函数、零依赖），
+#   因为控制台画历史曲线也要算它。两份公式是"两份真相"，会悄悄分家，
+#   而且永远不会报错；所以这里只做转发，别把算式搬回来。
+#   P 由心境给，A/D 由激素给，全部相对基线：基线=平静=0。
 # ---------------------------------------------------------------------------
-PAD_NEUTRAL_BAND = 0.15      # |P|、|A| 都小于这个数，读作"平静"
-PAD_AROUSAL_EDGE = 0.35      # A 超过这个数才算"绷着"，低于负数算"没劲"
+PAD_NEUTRAL_BAND = padlib.PAD_NEUTRAL_BAND
+PAD_AROUSAL_EDGE = padlib.PAD_AROUSAL_EDGE
 
 
 def pad_label(p, a):
-    """给 P/A 两个轴起个中文名。只用来显示，不参与任何判定。"""
-    if abs(p) < PAD_NEUTRAL_BAND and abs(a) < PAD_NEUTRAL_BAND:
-        return "平静"
-    if p >= PAD_NEUTRAL_BAND:
-        if a >= PAD_AROUSAL_EDGE:
-            return "雀跃"          # 高兴得坐不住
-        if a <= -PAD_AROUSAL_EDGE:
-            return "安稳"          # 高兴但懒懒的
-        return "愉快"
-    if p <= -PAD_NEUTRAL_BAND:
-        if a >= PAD_AROUSAL_EDGE:
-            return "紧绷"          # 低落又绷着 —— 一维心境说不出的那种
-        if a <= -PAD_AROUSAL_EDGE:
-            return "低落"          # 低落且没劲
-        return "闷闷的"
-    # 心情不高不低，但有情绪张力：往哪边偏，读法不一样
-    #   P 略正 + 高唤醒 = 亢奋；P 略负 + 高唤醒 = 坐立不安
-    #   （原来一律叫"坐立不安"，可 mood=0.57 的人不可能是坐立不安）
-    if a >= PAD_AROUSAL_EDGE:
-        return "亢奋" if p >= 0.0 else "坐立不安"
-    if a <= -PAD_AROUSAL_EDGE:
-        return "没劲"
-    return "平静"
+    """给 P/A 两个轴起个中文名（实现见 padlib）。"""
+    return padlib.pad_label(p, a)
 
 
 def pad_style_hint(pad):
-    """把 PAD 翻成一句"我现在什么状态"，塞进上下文给宿主参考。
-
-    刻意只给状态、不给命令（跟 hormone.style_hint 同一套原则）：
-    「我在难过，别闹」比「请表现得难过一点」管用 —— 后者是让她演。
-    """
-    if not pad:
-        return ""
-    p = float(pad.get("p", 0.0) or 0.0)
-    a = float(pad.get("a", 0.0) or 0.0)
-    d = float(pad.get("d", 0.0) or 0.0)
-    bits = []
-    if p <= -0.35:
-        bits.append("现在心情很低")
-    elif p <= -PAD_NEUTRAL_BAND:
-        bits.append("现在心情不太好")
-    elif p >= 0.35:
-        bits.append("现在心情很好")
-    if a >= PAD_AROUSAL_EDGE:
-        bits.append("有点绷着" if d < 0.0 else "有点亢奋")
-    elif a <= -PAD_AROUSAL_EDGE:
-        bits.append("懒懒的，不想使劲")
-    if d <= -0.35 and p <= 0.0:
-        bits.append("没什么底气，别接玩笑")
-    elif d >= 0.35 and p >= PAD_NEUTRAL_BAND:
-        bits.append("心里挺踏实")
-    return "、".join(bits)
+    """把 PAD 翻成一句"我现在什么状态"（实现见 padlib）。"""
+    return padlib.style_hint(pad)
 
 
 def to_vec(text):
@@ -1609,40 +1563,12 @@ class MemoryCard:
            低落（P 负）分得清是"平静地低落"还是"紧绷着低落"（A 的差）。
 
         ⚠️ 这是一个**纯读法**：不写库、不改激素、不进召回打分。
-           公式只有这一处，控制台必须读 /status.pad，不许自己再算一遍。
+           算式在 padlib.py（纯函数），这里是转发；控制台画历史曲线也用同一份。
         """
-        base = getattr(hormone, "H_BASE", {"h_sero": 0.6, "h_dopa": 0.4,
-                                            "h_cort": 0.2, "h_oxy": 0.5})
-
-        def _num(v, dflt):
-            try:
-                x = float(v)
-                return dflt if (x != x) else x          # NaN 兜底
-            except Exception:
-                return dflt
-
         h = getattr(self, "h", {}) or {}
-        sero = _num(h.get("h_sero"), base["h_sero"])
-        dopa = _num(h.get("h_dopa"), base["h_dopa"])
-        cort = _num(h.get("h_cort"), base["h_cort"])
-        oxy = _num(h.get("h_oxy"), base["h_oxy"])
-        mood = _num(getattr(self, "mood", MOOD_NEUTRAL), MOOD_NEUTRAL)
-
-        # 两条轴的基线值（从 H_BASE 算，改基线不用改这里）
-        a0 = 0.6 * base["h_dopa"] + 0.4 * base["h_cort"]
-        d0 = 0.6 * base["h_oxy"] + 0.4 * (1.0 - base["h_cort"])
-        k_a = 0.6 * dopa + 0.4 * cort
-        k_d = 0.6 * oxy + 0.4 * (1.0 - cort)
-
-        SCALE = 3.2      # 激素推到满时接近 ±1；太小天天顶格，太钝读不出来
-        p = (mood - MOOD_NEUTRAL) * 2.0
-        a = (k_a - a0) * SCALE
-        d = (k_d - d0) * SCALE
-        p, a, d = (round(max(-1.0, min(1.0, x)), 3) for x in (p, a, d))
-        return {"p": p, "a": a, "d": d, "label": pad_label(p, a),
-                "src": {"mood": round(mood, 3),
-                        "sero": round(sero, 3), "dopa": round(dopa, 3),
-                        "cort": round(cort, 3), "oxy": round(oxy, 3)}}
+        return padlib.pad_of(getattr(self, "mood", MOOD_NEUTRAL),
+                             h.get("h_sero"), h.get("h_dopa"),
+                             h.get("h_cort"), h.get("h_oxy"))
 
     def touch_hormones(self, text):
         """一句话扰动四个激素（V5.0 §4.3），返回这次判定的事件类型"""

@@ -39,6 +39,8 @@ import os
 import sqlite3
 import time
 
+import padlib      # 零依赖纯函数：PAD 公式只住在这里
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_DB = os.environ.get("WHALE_DB") or os.path.join(HERE, "card.db")
 
@@ -119,11 +121,18 @@ def hormones_series(db_path=DEFAULT_DB, hours=24.0, limit=400):
                 "SELECT ts, sero, dopa, cort, oxy, mood, oxy_g FROM h_log"
                 " ORDER BY ts DESC LIMIT ?", (limit,)).fetchall()
             rows = list(reversed(rows))
-        out = [{"ts": round(_f(r["ts"]), 1),
-                "sero": round(_f(r["sero"]), 4), "dopa": round(_f(r["dopa"]), 4),
-                "cort": round(_f(r["cort"]), 4), "oxy": round(_f(r["oxy"]), 4),
-                "mood": round(_f(r["mood"]), 4), "oxy_g": round(_f(r["oxy_g"]), 4)}
-               for r in rows]
+        out = []
+        for r in rows:
+            mood = _f(r["mood"]); sero = _f(r["sero"])
+            dopa = _f(r["dopa"]); cort = _f(r["cort"]); oxy = _f(r["oxy"])
+            # PAD 由 padlib 现算 —— h_log 里只存心境和激素，不存派生量。
+            # 存了就等于把同一件事写两遍，以后改公式还得改历史数据。
+            pad = padlib.pad_of(mood, sero, dopa, cort, oxy)
+            out.append({"ts": round(_f(r["ts"]), 1),
+                        "sero": round(sero, 4), "dopa": round(dopa, 4),
+                        "cort": round(cort, 4), "oxy": round(oxy, 4),
+                        "mood": round(mood, 4), "oxy_g": round(_f(r["oxy_g"]), 4),
+                        "p": pad["p"], "a": pad["a"], "d": pad["d"]})
         c.close()
     except Exception:
         pass
@@ -715,6 +724,7 @@ nav .stamp{color:var(--dim2);font-size:11.5px;font-variant-numeric:tabular-nums}
 #cvTT,#cvTK,#cvMW,#cvMWr,#cvMS{min-height:170px}
 #cvFC{min-height:230px}
 #cvSrc,#cvR,#cvRadar,#cvSyn,#cvWH,#cvRec{min-height:200px}
+#cvH,#cvPad{min-height:150px}
 #cvSys{min-height:190px}
 #cvIO{min-height:150px}
 .live{font-size:10px;color:var(--ok);border:1px solid rgba(102,192,138,.35);
@@ -992,6 +1002,8 @@ function fitCanvas(cv, h){
 }
 function lineChart(cv, series, opts){
   opts=opts||{};
+  var lo=(opts.min!=null)?opts.min:0, hi=(opts.max!=null)?opts.max:1;
+  var span=(hi-lo)||1;
   var f=fitCanvas(cv, opts.height||170), g=f.g, W=f.w, H=f.h;
   var padL=30, padR=8, padT=8, padB=18;
   var iw=W-padL-padR, ih=H-padT-padB;
@@ -1001,7 +1013,13 @@ function lineChart(cv, series, opts){
   for(var k=0;k<=4;k++){
     var y=padT+ih*k/4;
     g.beginPath(); g.moveTo(padL,y); g.lineTo(W-padR,y); g.stroke();
-    g.fillText((1-k/4).toFixed(2), 3, y+3);
+    g.fillText((hi-span*k/4).toFixed(2), 3, y+3);
+  }
+  /* 跨零的轴（PAD 的 −1..1）：把 0 那条线画实一点，不然看不出正负分界 */
+  if(lo<0 && hi>0){
+    var y0=padT+ih*(1-(0-lo)/span);
+    g.strokeStyle="#2b3a4a"; g.setLineDash([3,3]); g.beginPath();
+    g.moveTo(padL,y0); g.lineTo(W-padR,y0); g.stroke(); g.setLineDash([]);
   }
   var n=0;
   series.forEach(function(s){ n=Math.max(n, s.pts.length); });
@@ -1016,11 +1034,12 @@ function lineChart(cv, series, opts){
     g.beginPath();
     for(var i=0;i<pts.length;i++){
       var x=padL+iw*i/(Math.max(1,pts.length-1));
-      var y=padT+ih*(1-Math.max(0,Math.min(1,pts[i])));
+      var v=(pts[i]-lo)/span;
+      var y=padT+ih*(1-Math.max(0,Math.min(1,v)));
       i?g.lineTo(x,y):g.moveTo(x,y);
     }
     g.strokeStyle=s.color; g.lineWidth=1.7; g.lineJoin="round"; g.stroke();
-    if(s.fill!==false){
+    if(s.fill!==false && !opts.noFill){
       g.lineTo(padL+iw, padT+ih); g.lineTo(padL, padT+ih); g.closePath();
       g.fillStyle=s.color+"22"; g.fill();
     }
@@ -1743,7 +1762,7 @@ function viewDash(){
     '</div>');
 
   /* ── ② 激素场 ── */
-  out += cardHTML("c8","HORMONE FIELD / 激素场 (24H)",
+  out += cardHTML("c12","HORMONE FIELD / 激素场 (24H)",
     '<canvas id="cvH"></canvas>'+
     '<div class="legend">'+
     '<span><i style="background:#57c8f0"></i>SERO 血清素</span>'+
@@ -1751,6 +1770,17 @@ function viewDash(){
     '<span><i style="background:#ff5f6d"></i>CORT 皮质醇</span>'+
     '<span><i style="background:#9d8bff"></i>OXY 催产素</span>'+
     '</div>', hlog.length+" 采样点");
+  /* ── ②b PAD 三维（由 h_log 现算；公式只在 padlib.py 一处） ── */
+  var padNow=(d.status&&d.status.pad)||{};
+  out += cardHTML("c12","PAD FIELD / 情绪三维 (24H)",
+    '<canvas id="cvPad"></canvas>'+
+    '<div class="legend">'+
+    '<span><i style="background:#e8b44a"></i>P 愉悦</span>'+
+    '<span><i style="background:#ff5f6d"></i>A 唤醒</span>'+
+    '<span><i style="background:#57c8f0"></i>D 掌控</span>'+
+    '<span style="color:#3f5164">轴随波动自动缩放 · 虚线 0 = 平静</span>'+
+    '</div>',
+    (padNow.label?("现在 "+padNow.label):"—")+" · "+hlog.length+" 采样点");
   /* ── ③ 当前激素读数 ── */
   var hstat=function(k){
     var vs=hlog.map(function(p){ return Number(p[k]||0); }).filter(function(v){ return isFinite(v); });
@@ -2346,6 +2376,27 @@ function draw(){
       {color:"#ff5f6d", pts:hlog.map(function(x){return x.cort;})},
       {color:"#9d8bff", pts:hlog.map(function(x){return x.oxy;})}
     ], {height:cvh(cv,CH(0.17,130,225))});
+    /* PAD 三条线：固定 −1..1 会把三条线压成一条扁线（实测波动只有 0.2），
+       所以轴按实际波动自动缩放；跨零时那条虚线就是"平静"。 */
+    var cvp=$("#cvPad");
+    if(cvp){
+      var pv=[];
+      hlog.forEach(function(x){
+        [x.p,x.a,x.d].forEach(function(v){ if(isFinite(v)) pv.push(Number(v)); });
+      });
+      if(pv.length){
+        var lo=Math.min.apply(null,pv), hi=Math.max.apply(null,pv);
+        var padm=(hi-lo)*0.12 || 0.05;
+        lo-=padm; hi+=padm;
+        if(hi-lo<0.24){ var mid=(hi+lo)/2; lo=mid-0.12; hi=mid+0.12; }
+        lo=Math.max(-1,lo); hi=Math.min(1,hi);
+        lineChart(cvp, [
+          {color:"#e8b44a", fill:false, pts:hlog.map(function(x){return x.p;})},
+          {color:"#ff5f6d", fill:false, pts:hlog.map(function(x){return x.a;})},
+          {color:"#57c8f0", fill:false, pts:hlog.map(function(x){return x.d;})}
+        ], {height:cvh(cvp,CH(0.17,130,225)), min:lo, max:hi, noFill:true});
+      }
+    }
     // 召回频率：24 小时柱
     var crec=$("#cvRec");
     if(crec){
