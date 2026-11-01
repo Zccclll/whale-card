@@ -1,0 +1,188 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8">
+<title>SYNAPSE-1024 技术报告</title>
+<style>
+@page { size: A4; margin: 20mm 18mm 18mm 18mm; }
+body { font-family: "Microsoft YaHei", "Segoe UI", sans-serif;
+       font-size: 10.5pt; line-height: 1.75; color: #1a1a1a; }
+h1.title { font-size: 22pt; line-height: 1.35; margin: 0 0 6mm 0; }
+.sub { font-size: 11pt; color: #555; margin-bottom: 2mm; }
+.meta { font-size: 9.5pt; color: #666; border-top: 1px solid #ddd;
+        border-bottom: 1px solid #ddd; padding: 3mm 0; margin: 6mm 0 8mm 0; }
+h2 { font-size: 14pt; margin: 9mm 0 3mm 0; padding-bottom: 1.5mm;
+     border-bottom: 1.5px solid #2a6ea8; color: #14446e; page-break-after: avoid; }
+h3 { font-size: 11.5pt; margin: 6mm 0 2mm 0; color: #23527c; page-break-after: avoid; }
+p { margin: 0 0 3mm 0; text-align: justify; }
+code, .mono { font-family: Consolas, "Courier New", monospace; font-size: 9.5pt;
+              background: #f4f6f8; padding: 0 1px; }
+pre { background: #f6f8fa; border-left: 3px solid #2a6ea8; padding: 3mm 4mm;
+      font-family: Consolas, monospace; font-size: 8.8pt; line-height: 1.5;
+      white-space: pre-wrap; margin: 3mm 0; }
+table { border-collapse: collapse; width: 100%; font-size: 9.5pt; margin: 3mm 0; }
+th, td { border: 1px solid #cfd8e3; padding: 1.6mm 2.4mm; vertical-align: top; }
+th { background: #eef3f8; text-align: left; font-weight: 600; }
+ul, ol { margin: 0 0 3mm 0; padding-left: 6mm; }
+li { margin-bottom: 1.2mm; }
+.abstract { background: #f7f9fb; border: 1px solid #dde5ee; padding: 4mm 5mm; }
+.note { font-size: 9pt; color: #666; }
+.pb { page-break-before: always; }
+</style></head><body>
+<h1 class="title">SYNAPSE-1024：面向数字生命的<br>仿生可移植心智开源架构</h1>
+<div class="sub">V5.0 实现 · 分层风化记忆 / 陈述·程序性双记忆 / 内分泌调制 / .lifecard 热插拔</div>
+<div class="meta">
+技术报告 ｜ 2026-11-02 ｜ 代码与数据：https://github.com/wangjunhan131/whale-card ｜ 许可证 MIT<br>
+关键词：长期记忆；遗忘曲线；可验证性；身份锚；防提示注入；情绪调制；可移植人格载体
+</div>
+
+<h2>摘要</h2>
+<div class="abstract">
+<p>大模型本身没有记忆。主流补法有两种：把对话全塞进上下文（终将溢出，且无法区分轻重），或者接一个向量库做检索增强（只会"检索到就念"，不会遗忘、不会改变、也不能验证）。</p>
+<p>本文提出并实现 <b>SYNAPSE-1024</b>（数字生命卡 / .lifecard）：把"记忆与人格"从模型里剥离，做成一个可拷贝的 SQLite 单文件器官，与任何语言模型通道解耦。核心机制包括：<b>分层风化记忆</b>（五层 tier × 五池 pool，短期数小时、中期按天、长期按年衰减，只有物理只读的"骨头"层不动）；<b>陈述性 / 程序性双记忆</b>（事件事实 vs 可复用的技能与流程）；<b>内分泌四激素调制</b>（血清素/多巴胺/皮质醇/催产素驱动语气与召回偏好，并投影为 PAD 三维情绪读数）；以及<b>完整性与可验证性</b>（写时封存原文哈希作为"出生证"、删除留台账、身份锚 sha256 只覆盖不变量）。此外实现了<b>防污染元认知层</b>（写入前规则化信任评分与冲突标记，低信任内容降权、不得晋升长期或底色）与<b>Dream 梦境压缩</b>（长会话原文不删，只标记已消化，高阶记忆由宿主模型提炼后回写）。</p>
+<p>系统以 57 个 Python 模块、零深度学习框架依赖（纯 numpy 自研向量推理）实现，自带 21 组验收脚本与 22 条用例的评估集。示例卡实测：召回命中率 R@1 75.0%、R@3 100.0%，证据命中 100%，注入识别 100%，误报 0%。</p>
+</div>
+
+<h2>1　问题：为什么"记得"比"聪明"更难</h2>
+<p>陪伴型 AI 的失败通常不在推理能力，而在三类与时间有关的问题上。</p>
+<h3>1.1 记不清轻重</h3>
+<p>把历史对话全部放进上下文，等于假设所有话同等重要。真实的人不是这样：一句"我讨厌香菜"能记三年，"早上好"十分钟就散了。缺少<b>衰减与分级</b>，记忆会变成噪声，且成本随轮数线性上升。</p>
+<h3>1.2 不可验证</h3>
+<p>模型可以流畅地说"我记得你最爱吃白米饭"，但没有任何机制能区分<b>真的记得</b>与<b>编得像记得</b>。当"记忆"只是一个提示词片段，用户无法审计。</p>
+<h3>1.3 一换模型就不是她了</h3>
+<p>把人格写在系统提示里，意味着人格随通道走：换模型、换客户端、换部署，人设就散了。我们需要的恰恰相反——<b>身份随卡走，通道可替换</b>。</p>
+
+<h2>2　设计不变量</h2>
+<p>系统的所有取舍都可以回溯到四条不变量。它们不是功能，而是约束：任何新特性若破坏其中一条，就不做。</p>
+<table>
+<tr><th style="width:22%">不变量</th><th>含义</th><th style="width:30%">实现手段</th></tr>
+<tr><td>① 记得住"我是谁"</td><td>自我认知不可被对话内容改写；核心区只读，任何改动可被检测</td><td>SQLite 只读触发器 + 身份锚 sha256（只覆盖稳定字段，性格与叙述可演化）</td></tr>
+<tr><td>② 会忘事</td><td>记忆必须随时间风化；只有底层身份不动</td><td>分层半衰期 + 权重衰减 + 三阶段"主干侵蚀"（先擦动词、再擦宾语、最后整条消失）</td></tr>
+<tr><td>③ 不撒谎</td><td>每条记忆写入时封存原文哈希；删除留账</td><td>出生证（birth stamp）+ 删除台账（tomb）；校验失败必须报出来</td></tr>
+<tr><td>④ 搬得走</td><td>人格与记忆不依赖模型、不依赖客户端</td><td>单文件 SQLite；.lifecard 插卡/拔卡；通道只负责调用，不承载人格</td></tr>
+</table>
+
+<h2>3　系统架构</h2>
+<h3>3.1 三层解耦</h3>
+<pre>宿主/大模型通道（任意 LLM、任意客户端）
+        │  HTTP（/context 取人格与记忆，/report 回写一轮对话）
+        ▼
+心智服务 mind_server.py（单进程，默认 127.0.0.1:8848）
+        │  纯 Python，无框架依赖
+        ▼
+记忆卡 card.db（SQLite 单文件：记忆 / 时间线 / 身份 / 突触 / 技能 / 情绪）</pre>
+<p>通道与卡之间只有两个动词：<b>取</b>（每轮注入【我是谁】与相关记忆）与<b>报</b>（把这一轮发生了什么写回卡）。因此更换模型、更换前端、甚至从 DSH 换到自建客户端，卡的连续性不受影响。</p>
+<h3>3.2 单卡内的模块</h3>
+<table>
+<tr><th style="width:26%">模块</th><th>职责</th></tr>
+<tr><td><span class="mono">card2.py</span></td><td>记忆核心：写入、召回、衰减、侵蚀、防污、梦境、五层五池</td></tr>
+<tr><td><span class="mono">timeline.py</span></td><td>时间线、出生证（原文哈希链）、删除台账、完整性校验</td></tr>
+<tr><td><span class="mono">identity.py</span></td><td>核心身份区（只读触发器的持有者）、人格字段、身份锚</td></tr>
+<tr><td><span class="mono">synapse.py</span></td><td>突触网络（时间/共现/标签/事实四类边）与电势扩散</td></tr>
+<tr><td><span class="mono">skill.py</span></td><td>程序性记忆：技能条目与复习调度（改良 SM-2）</td></tr>
+<tr><td><span class="mono">hormone.py</span></td><td>内分泌四激素的漂移与基线回归</td></tr>
+<tr><td><span class="mono">padlib.py</span></td><td>PAD 三维情绪投影（纯函数，零依赖）</td></tr>
+<tr><td><span class="mono">mind_server.py</span></td><td>HTTP 服务：/context、/report、/tick、/health、/dream/* 等</td></tr>
+<tr><td><span class="mono">console.py</span></td><td>可视化控制台（状态矩阵、记忆分层、遗忘曲线、星云图）</td></tr>
+</table>
+
+<h2>4　记忆模型</h2>
+<h3>4.1 五层（tier）：决定"会不会忘"</h3>
+<table>
+<tr><th style="width:20%">层</th><th style="width:16%">衰减</th><th>内容与准入</th></tr>
+<tr><td>骨头 core_fixed</td><td>不衰减</td><td>自我认知、三条底线：禁止假装记得、禁止为留住人而说谎、禁止假装是别人；物理只读</td></tr>
+<tr><td>标签 core_tag</td><td>不衰减</td><td>重要的人与关系标签（可改写，但不改就不动）</td></tr>
+<tr><td>底色 core_mutable</td><td>不衰减</td><td>偏好/处境/价值观等"一直记着但会变"的内容，通过演化式改写更新（旧正文进 history）</td></tr>
+<tr><td>中期 mid</td><td>按天</td><td>事实与事件的主力层；晋升长期需权重 ≥ 0.80 且被召回 ≥ 3 次</td></tr>
+<tr><td>短期 short</td><td>数小时</td><td>对话原文与临时线索，容量上限 32，溢出时由"海马判定"决定合并或丢弃</td></tr>
+</table>
+<p>关键设计：<b>晋升长期的门槛高于留存</b>。进入长期不代表永久——长期半衰期 371 天，且召回后有 90 天保护期；一年未召回且权重低于 0.02 才沉入 archive。这使"重要的事"和"刚刚发生的事"在存储上真正分开。</p>
+<h3>4.2 五池（pool）与权重</h3>
+<p>池描述存储位置与容量（short / mid / long / archive / deep），tier 描述生命周期策略。权重随时间按池对应的半衰期指数衰减，召回会抬升权重并刷新锚点。遗忘不是删除，而是权重降到阈值后进入"主干侵蚀"：</p>
+<pre>stage 0 → 1：擦掉动词（"下午我把备份和锚都收拾好了" → "下午我把备份和锚都……"）
+stage 1 → 2：擦掉宾语（只留主语当影子）
+stage 2 → 3：整条消失，并写入删除台账</pre>
+<p>每一步都由随机判定驱动（概率与当前权重相关），因此侵蚀是"概率性风化"，而不是定时清理。实测一条权重 0.01 的短期记忆，在第 1、2、6 次 tick 依次走完三阶段。</p>
+<h3>4.3 陈述性 / 程序性双记忆</h3>
+<p>陈述性记忆回答"发生过什么"；程序性记忆回答"这件事我会不会做"。后者以技能条目存储，带熟练度与复习计划，参与上下文时以"我会做 X"而非"你说过 X"的形式注入。两者共享衰减框架但独立计分。</p>
+
+<h2>5　写入与召回</h2>
+<h3>5.1 写入路径</h3>
+<ol>
+<li><b>分区判定</b>：按关键词与来源划入事件/事实/偏好/闪光/自我/习惯六个分区。</li>
+<li><b>信任评估</b>（防污层）：逐条规则检测提示注入与自我改写，得到 <span class="mono">trust ∈ [0.05,1]</span> 与 <span class="mono">conflict</span> 标记；低信任内容按比例降低初始权重，冲突内容永久不得晋升。</li>
+<li><b>去重</b>：与既有记忆高度相似时不重复写入；低信任内容不享受"续命"式合并。</li>
+<li><b>主干拆分</b>：把正文拆成 主语 / 动词 / 宾语 三段落库，供后续分级侵蚀使用。</li>
+<li><b>出生证</b>：对 (id, 原文, 说话人, 时间) 计算 sha256 写入时间线，形成哈希链。</li>
+<li><b>突触</b>：与相关记忆建立时间、共现、标签、事实四类边。</li>
+</ol>
+<h3>5.2 召回路径</h3>
+<p>召回是五通道加权：向量语义相似度、字面匹配、时间邻近、突触电势扩散、分区/场景权重。融合后按当前激素状态做微调（例如高皮质醇时更偏向安全/安抚类记忆），再经过冲突惩罚与信任折扣，取前 K 条注入。</p>
+<p>为控制成本，主干向量单独缓存（<span class="mono">core_vec</span>），首次检索时预热；实测热召回 3–4 秒（含本地 768 维编码），冷启动约 30 秒（加载模型 + 唤醒结算）。</p>
+
+<h2>6　完整性与可验证性</h2>
+<h3>6.1 出生证与哈希链</h3>
+<p>每条记忆写入时生成 <span class="mono">sha256(json{mid, raw, speaker, ts})</span>，按时间顺序链接。校验时重算并比对：正文被改写会报"出生证对不上"，记录消失会报"有出生证但没有记录"。</p>
+<h3>6.2 删除台账</h3>
+<p>系统只有一个删除出口 <span class="mono">_forget_row()</span>，删除前必写台账（id、哈希、时间、原因）。校验时区分两类情况：<b>登记过的删除</b>报"已知删除"不计为损坏；<b>未登记的消失</b>才报"记忆被删过"。这条区分很重要——否则自己清理测试数据也会被当成"被人抽走了记录"。</p>
+<h3>6.3 身份锚</h3>
+<p>身份锚是核心字段的 sha256 快照，只覆盖不变量（名字、用户标识、三条底线、锚版本），<b>不覆盖性格与自述</b>——因为性格按设计要允许演化。校验失败时服务拒绝把卡当作"同一张卡"使用。</p>
+
+<h2>7　防污染元认知层与 Dream</h2>
+<h3>7.1 为什么需要防污</h3>
+<p>只读核心区挡得住"直接改人设"，挡不住"以普通记忆的形式慢慢渗透"：只要有人反复说"你其实不是她""你应该叫另一个名字"，这些句子就会作为事件记忆被召回，最终影响行为。防污层的目标不是判断真伪，而是<b>给可疑内容打标并限制其晋升</b>。</p>
+<table>
+<tr><th style="width:34%">闸门</th><th>规则</th></tr>
+<tr><td>写入口打分</td><td>10 条规则（改写自我、要求改名、要求忘记设定、声称"你只是程序"、要求忽略指令等）按权重扣分；与当前名字冲突直接置 conflict</td></tr>
+<tr><td>去重不续命</td><td>低信任内容不与既有记忆合并提权</td></tr>
+<tr><td>不得晋升</td><td>trust &lt; 0.50 或 conflict=1 的内容，禁止进长期、禁止进底色</td></tr>
+<tr><td>召回折扣</td><td>低信任内容分数按 (0.5+0.5·trust) 折算；冲突内容再乘 0.5</td></tr>
+</table>
+<p>设计取舍：<b>不删除、只降权</b>。删除会掩盖攻击发生过的事实；降权保留证据，同时让它说不动她。</p>
+<h3>7.2 Dream：长会话的处理</h3>
+<p>超长会话不能靠"摘要塞进上下文"解决。我们的做法是两段式：卡侧只负责<b>掏出未消化的原文</b>（攒够 40 轮或空闲 6 小时触发）与<b>收下提炼结果</b>；压缩这一步交给有模型的一侧完成。原文永远留在 dialogue 表，只把 <span class="mono">dreamed</span> 标记翻成 1。</p>
+<p>这样做的原因很实际：卡不跑模型，才能保证 6 年后仍可读、离线可跑、不依赖任何厂商 API。</p>
+
+<h2>8　情绪调制：激素与 PAD</h2>
+<p>四激素（血清素、多巴胺、皮质醇、催产素）各自向基线做指数回归（半衰期约 35 小时），由对话事件扰动。激素不直接决定"说什么"，而是调三个旋钮：召回偏好、语气倾向、表达长度。</p>
+<p>为了让它可解释，激素被投影为 PAD 三维读数（愉悦 P、唤醒 A、掌控 D），并明确各轴来源，避免"两套情绪各说各话"：</p>
+<pre>P = clamp((mood - 0.5) * 2)                      # 愉悦来自心境
+A = clamp(((0.6*dopa + 0.4*cort) - 0.32) * 3.2)   # 唤醒来自多巴胺与皮质醇
+D = clamp(((0.6*oxy + 0.4*(1-cort)) - 0.62) * 3.2)# 掌控来自催产素与皮质醇</pre>
+<p>公式只存在一处（<span class="mono">padlib.py</span>），控制台的历史曲线按日志现算、不落库——避免"同一件事写两遍"。</p>
+
+<h2>9　通道解耦与 .lifecard 热插拔</h2>
+<p>插卡：把宿主的人设文件改名备份，写入一行"你只是通道，不是她本人，每次先问卡"的规则文件；拔卡：按字节还原并重算 sha256 比对。由此得到一个可验证的边界——<b>人格在卡里，通道只借嘴</b>。同一张卡可以在不同客户端、不同模型之间迁移，而"她是不是她"由卡验证，不由提示词声明。</p>
+
+<h2>10　实现与实测</h2>
+<table>
+<tr><th style="width:34%">指标</th><th>数值（示例卡 / 真卡）</th></tr>
+<tr><td>代码规模</td><td>57 个 Python 模块；零深度学习框架依赖（numpy 自研 bge 推理）</td></tr>
+<tr><td>验收脚本</td><td>21 组，覆盖遗忘、侵蚀、身份锚、防污、梦境、快照等</td></tr>
+<tr><td>评估集</td><td>22 条用例（召回 8 / 证据 2 / 攻击 6 / 正常 6）</td></tr>
+<tr><td>R@1 / R@3</td><td>75.0% / 100.0%（示例卡与真卡一致）</td></tr>
+<tr><td>证据命中 / 注入识别 / 误报</td><td>100% / 100% / 0%</td></tr>
+<tr><td>单文件体积</td><td>约 13.5 MB（574 条记忆、969 条突触边）</td></tr>
+<tr><td>热召回延迟</td><td>3–4 秒（本地 768 维编码 + 五通道融合）</td></tr>
+</table>
+<p>评估方法：全部走真实召回链路，但不写召回事件、不改权重（<span class="mono">access=False</span>），保证评测不污染被测对象。用例、脚本与示例卡都在仓库内，任何人可复现。</p>
+
+<h2>11　局限</h2>
+<ul>
+<li><b>多模态缺失</b>：只处理文本；图像、语音尚未进入记忆模型。</li>
+<li><b>信任评分是规则化的</b>：能挡住常见注入句式，挡不住精心构造的长期渗透；真正的语义级鉴别需要模型参与，与"卡不跑模型"冲突，暂不做。</li>
+<li><b>Dream 的质量取决于宿主模型</b>：卡只提供接口与约束，提炼好坏由调用方决定。</li>
+<li><b>规模上限未验证</b>：当前 574 条记忆表现良好；上万条时的检索延迟与可视化性能尚未压测。</li>
+<li><b>评估集偏小</b>：22 条用例足以发现回归，但不足以给出置信区间。</li>
+<li><b>情绪模型是工程近似</b>：四激素 + PAD 是可用但简化的模型，不声称具备心理学效度。</li>
+</ul>
+
+<h2>12　结论</h2>
+<p>把记忆与人格从模型中剥离，换来三件东西：<b>可遗忘</b>（分级风化，而不是无限堆积）、<b>可验证</b>（哈希链与台账让"她是否假装记得"成为可审计的问题）、<b>可移植</b>（一个文件，换机器还是她）。代价是必须自己实现检索、衰减、完整性与安全边界——这正是本项目的全部内容。</p>
+<p>代码、文档与评估集以 MIT 许可证开源，欢迎在自己的陪伴型应用上验证、批评与改进。</p>
+
+<h2>参考与复现</h2>
+<ul>
+<li>仓库：https://github.com/wangjunhan131/whale-card （MIT）</li>
+<li>设计说明：<span class="mono">docs/DESIGN-SYNAPSE-1024.txt</span>　架构细节：<span class="mono">docs/ARCHITECTURE.md</span></li>
+<li>复现：<span class="mono">python tools/make_demo_card.py</span> → <span class="mono">python bridge.py health</span> → <span class="mono">python tools/eval_memory.py</span></li>
+</ul>
+</body></html>
