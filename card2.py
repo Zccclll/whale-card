@@ -622,9 +622,11 @@ def pad_label(p, a):
         if a <= -PAD_AROUSAL_EDGE:
             return "低落"          # 低落且没劲
         return "闷闷的"
-    # 心情不高不低，但有情绪张力
+    # 心情不高不低，但有情绪张力：往哪边偏，读法不一样
+    #   P 略正 + 高唤醒 = 亢奋；P 略负 + 高唤醒 = 坐立不安
+    #   （原来一律叫"坐立不安"，可 mood=0.57 的人不可能是坐立不安）
     if a >= PAD_AROUSAL_EDGE:
-        return "坐立不安"
+        return "亢奋" if p >= 0.0 else "坐立不安"
     if a <= -PAD_AROUSAL_EDGE:
         return "没劲"
     return "平静"
