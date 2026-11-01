@@ -1,5 +1,9 @@
 # 数字生命卡 · Life Card
 
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.23857785.svg)](https://doi.org/10.5281/zenodo.23857785)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Release](https://img.shields.io/badge/release-v1.0.0-2fd07d.svg)](https://github.com/wangjunhan131/whale-card/releases/tag/v1.0.0)
+
 > **代号 SYNAPSE-1024**
 > 灵感来自 APTX4869 —— 那颗药想让人不老不死，副作用是把他变成了另一个人。
 > 这张卡想让人不被忘记，副作用是她会忘事。
@@ -15,6 +19,8 @@
 ![控制台](docs/console.png)
 
 ![星云](docs/nebula.png)
+
+> 📄 技术报告（PDF）：[docs/technical-report.pdf](docs/technical-report.pdf) ｜ 设计说明：[docs/DESIGN-SYNAPSE-1024.txt](docs/DESIGN-SYNAPSE-1024.txt) ｜ 架构细节：[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
 
 ---
 
@@ -220,3 +226,28 @@ EVID   100.0%      FLAG   100.0%      FALSE  0.0%      PASS ✅
 MIT。拿去改、拿去用、拿去做产品都行，保留版权声明即可。
 
 如果你也在做同样的事——给某个 AI 一张能忘事的脑子——欢迎来提 issue 说说你踩到的坑。
+
+---
+
+## 引用
+
+如果这份实现对你的工作有帮助，请按下面任一格式引用。稳定的概念 DOI（始终指向最新版本）是 **10.5281/zenodo.23857785**。
+
+```bibtex
+@software{synapse1024_2026,
+  author       = {wangjunhan131},
+  title        = {SYNAPSE-1024: 面向数字生命的仿生可移植心智开源架构（V5.0 实现）},
+  year         = {2026},
+  publisher    = {Zenodo},
+  version      = {v1.0.0},
+  doi          = {10.5281/zenodo.23857786},
+  url          = {https://doi.org/10.5281/zenodo.23857786}
+}
+```
+
+> wangjunhan131. (2026). *SYNAPSE-1024: 面向数字生命的仿生可移植心智开源架构（V5.0 实现）* (v1.0.0) [Computer software]. Zenodo. https://doi.org/10.5281/zenodo.23857786
+
+- 概念 DOI（所有版本）：[10.5281/zenodo.23857785](https://doi.org/10.5281/zenodo.23857785)
+- 本版 DOI（v1.0.0）：[10.5281/zenodo.23857786](https://doi.org/10.5281/zenodo.23857786)
+- Zenodo 记录：https://zenodo.org/records/23857786
+- GitHub 发布页：https://github.com/wangjunhan131/whale-card/releases/tag/v1.0.0
