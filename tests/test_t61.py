@@ -15,7 +15,8 @@ import urllib.error
 import urllib.request
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, HERE)
+ROOT = os.path.dirname(HERE)  # 修复（大肥鱼 2026-11-02）：mind_server.py 在仓库根不在 tests/
+sys.path.insert(0, ROOT)
 
 import mind_server                                   # noqa: E402
 from card2 import MemoryCard                         # noqa: E402
@@ -145,7 +146,7 @@ print("=" * 50)
 
 port = free_port()
 proc = subprocess.Popen(
-    [PY, "-X", "utf8", os.path.join(HERE, "mind_server.py"),
+    [PY, "-X", "utf8", os.path.join(ROOT, "mind_server.py"),
      "--port", str(port), "--db", TMP],
     stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
 try:
@@ -227,7 +228,7 @@ except Exception as e:
 
 # 卡文件不存在时，进程应当拒绝启动而不是造一个空卡
 missing = os.path.join(HERE, "_definitely_not_here.db")
-r = subprocess.run([PY, "-X", "utf8", os.path.join(HERE, "mind_server.py"),
+r = subprocess.run([PY, "-X", "utf8", os.path.join(ROOT, "mind_server.py"),
                     "--port", str(free_port()), "--db", missing],
                    capture_output=True, text=True, timeout=60)
 ck("卡不存在时拒绝启动", r.returncode == 2, "exit=%d" % r.returncode)

@@ -16,6 +16,12 @@ try:
     import import_full as F
 except ImportError:
     F = None  # 开源仓库里不带私有导入器，相关检查自动跳过
+
+if F is None:
+    # 修复（大肥鱼 2026-11-02）：原注释说"自动跳过"但没写跳过逻辑，
+    # 本文件全部检查都依赖 F，缺导入器时整体跳过。
+    print("T5-2/T5-3 跳过：import_full 是作者私有导入器，不随开源仓库发布")
+    sys.exit(0)
 from card2 import MemoryCard
 
 ok = fail = 0
