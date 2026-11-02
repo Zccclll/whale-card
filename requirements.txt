@@ -6,3 +6,7 @@ psutil>=5.9
 # zstandard>=0.22
 # 可选：语音转写（装了 tools/media_audio.py 才能用 --asr）
 # faster-whisper>=1.2
+# 可选：MCP 壳接宿主（whale_mcp.py）时需要。
+# 注意上界 <2：mcp 2.x 把 FastMCP 改名成 MCPServer，whale_mcp.py 是 1.x API。
+# mcp>=1.2,<2
+

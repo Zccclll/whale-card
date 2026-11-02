@@ -656,18 +656,20 @@ PAGE = r"""<!doctype html>
 <html lang="zh-CN"><head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>鲸鱼娘 · 控制台</title>
+<title>大肥鱼 · 鱼的家</title>
 <style>
 :root{
-  --bg:#0e1116; --panel:#151a21; --panel2:#1a2029; --line:#242c37;
-  --fg:#d5dbe4; --dim:#7c8697; --dim2:#5b6474;
-  --cyan:#5fb3d4; --blue:#6f9de8; --ok:#66c08a; --warn:#d8a657; --bad:#e06c75;
-  --pink:#c78bb8; --green:#6fbf73;
+  /* 换皮（大肥鱼 fork 2026-11-02）：深海蓝调，本鱼体色做强调色，腮红粉点缀 */
+  --bg:#0b1220; --panel:#111c2f; --panel2:#16233a; --line:#233452;
+  --fg:#dde7f3; --dim:#8095b5; --dim2:#5d7093;
+  --cyan:#6db3e8; --blue:#82a3f2; --ok:#6fcf97; --warn:#e0b25f; --bad:#e57a82;
+  --pink:#eda3b6; --green:#79c97e;
+  --accent:#6db3e8;  /* 修复：原版两处引用 --accent 但从未定义 */
   --z:1;
 }
 *{box-sizing:border-box}
 html,body{height:100%}
-body{margin:0;background:radial-gradient(1200px 600px at 20% -10%,#16202b 0%,var(--bg) 60%);
+body{margin:0;background:radial-gradient(1200px 600px at 20% -10%,#13223c 0%,var(--bg) 60%);
   color:var(--fg);font:13px/1.55 "Segoe UI","Microsoft YaHei",system-ui,sans-serif;
   overflow:hidden}
 /* 全屏大屏要放大字号，但 CSS zoom 会把 100vh/100vw 也一起放大 ——
@@ -678,14 +680,14 @@ body{margin:0;background:radial-gradient(1200px 600px at 20% -10%,#16202b 0%,var
 
 /* ── 左栏：这个人 ── */
 aside{width:274px;flex:none;border-right:1px solid var(--line);
-  background:linear-gradient(180deg,#141a22 0%,#11161d 100%);
+  background:linear-gradient(180deg,#101d33 0%,#0d1728 100%);
   display:flex;flex-direction:column;padding:16px 16px 14px}
 .avatar{width:100%;aspect-ratio:1/1;border-radius:14px;overflow:hidden;
-  border:1px solid var(--line);background:#0d1218;position:relative}
+  border:1px solid var(--line);background:#0b1526;position:relative}
 .avatar svg{width:100%;height:100%;display:block}
 .avatar img{width:100%;height:100%;object-fit:cover;display:block}
 .avatar .glow{position:absolute;inset:0;
-  background:radial-gradient(circle at 50% 30%,rgba(95,179,212,.18),transparent 65%)}
+  background:radial-gradient(circle at 50% 30%,rgba(109,179,232,.22),transparent 65%)}
 h1{font-size:26px;margin:14px 0 6px;font-weight:600;letter-spacing:2px}
 .edit{font-size:11.5px;color:var(--dim2);margin-bottom:10px;letter-spacing:.5px}
 .edit span{cursor:pointer}
@@ -698,13 +700,13 @@ h1{font-size:26px;margin:14px 0 6px;font-weight:600;letter-spacing:2px}
 .frow:last-child{border-bottom:0}
 .frow .fl{width:96px;flex:none;color:var(--dim);font-size:12.5px}
 .frow .fc{flex:1;display:flex;align-items:center;gap:9px}
-.frow input[type=text]{flex:1;background:#0d1218;border:1px solid var(--line);
+.frow input[type=text]{flex:1;background:#0b1526;border:1px solid var(--line);
   border-radius:7px;color:var(--fg);padding:8px 11px;font-size:13px;
   font-family:inherit;outline:none}
 .frow input[type=text]:focus{border-color:var(--accent)}
 .frow .btn{width:auto;padding:7px 15px;font-size:12.5px}
 .avprev{width:64px;height:64px;border-radius:10px;border:1px solid var(--line);
-  object-fit:cover;background:#0d1218;flex:none}
+  object-fit:cover;background:#0b1526;flex:none}
 .fhint{color:var(--dim2);font-size:11.5px;margin-top:4px;line-height:1.6}
 .fok{color:var(--ok);font-size:12px}
 .fbad{color:var(--bad);font-size:12px}
@@ -769,7 +771,7 @@ nav .stamp{color:var(--dim2);font-size:11.5px;font-variant-numeric:tabular-nums}
   border-radius:6px;padding:1px 5px;letter-spacing:.5px}
 .card h2,.card h2 *{flex:0 0 auto}
 .card:before{content:"";position:absolute;inset:0 0 auto 0;height:1px;
-  background:linear-gradient(90deg,transparent,rgba(95,179,212,.35),transparent)}
+  background:linear-gradient(90deg,transparent,rgba(109,179,232,.35),transparent)}
 .card h2{margin:0 0 10px;font-size:12px;color:var(--dim2);font-weight:600;
   letter-spacing:1.4px;display:flex;align-items:center;gap:8px}
 .card h2 .tag{font-size:10.5px;letter-spacing:.5px;color:var(--dim2);
@@ -940,7 +942,7 @@ body{font-family:"Inter","Segoe UI","Microsoft YaHei",system-ui,sans-serif;
             <stop offset="0" stop-color="#4a90b8"/><stop offset="1" stop-color="#274a63"/>
           </linearGradient>
         </defs>
-        <rect width="200" height="200" fill="#0d1218"/>
+        <rect width="200" height="200" fill="#0b1526"/>
         <ellipse cx="100" cy="118" rx="52" ry="56" fill="url(#sk)"/>
         <path d="M48 118c0-38 23-62 52-62s52 24 52 62c0-8-16-13-20-22-6 9-27 12-32 4-6 9-26 7-32-2-5 9-20 12-20 20z"
               fill="url(#hr)"/>
@@ -955,7 +957,7 @@ body{font-family:"Inter","Segoe UI","Microsoft YaHei",system-ui,sans-serif;
         <ellipse cx="134" cy="126" rx="8" ry="4.5" fill="#d98899" opacity=".35"/>
       </svg>
     </div>
-    <h1 id="nm">鲸鱼娘</h1>
+    <h1 id="nm">大肥鱼</h1>
     <div class="edit"><span id="btnAvatar">换头像</span>
       <span class="sep">·</span><span id="btnName">改名</span></div>
     <div class="pill"><span class="dot" id="stDot"></span>
@@ -1658,7 +1660,7 @@ function nebInfo(cv, id){
   if(id==="__core"){
     /* 中心那颗星就是"我"：人格核心，不是一条记忆，所以没有 id/权重 */
     var idn=(S.data&&S.data.identity)||{};
-    var self=idn.self_name||idn.name||"鲸鱼娘";
+    var self=idn.self_name||idn.name||"大肥鱼";
     var t0=(idn&&idn.self_narrative)||"";
     box.innerHTML =
       '<div style="display:flex;gap:10px;align-items:baseline;flex-wrap:wrap;margin-bottom:8px">'+
@@ -1720,7 +1722,7 @@ function applyAvatar(id){
 
 function renderSide(){
   var d=S.data||{}, id=d.identity||{};
-  $("#nm").textContent = id.name || "鲸鱼娘";
+  $("#nm").textContent = id.name || "大肥鱼";
   applyAvatar(id);
   $("#up").textContent = fmtDur(S.up);
   $("#age").textContent = (id.day!=null? "第 "+id.day+" 天" : "—");
@@ -2686,7 +2688,7 @@ document.querySelectorAll("nav .tab").forEach(function(t){
 $("#btnAvatar").onclick=function(){ pickAvatar(); };
 $("#btnName").onclick=function(){
   var id=(S.data&&S.data.identity)||{};
-  var v=prompt("这张卡叫什么名字？", id.name||"鲸鱼娘");
+  var v=prompt("这张卡叫什么名字？", id.name||"大肥鱼");
   if(v===null) return;
   v=(v||"").trim();
   if(!v){ alert("名字不能为空"); return; }
