@@ -126,6 +126,15 @@ ERASE_STAGE_OBJ = 2    # 已擦掉宾语
 # 否则权重已经贴着 GC 线，擦完下一步就被回收，用户永远看不到残缺渲染。
 HUSK_W = 0.015
 
+# --- 大肥鱼拔刺改造（fork 2026-11-02）：遗忘只降权、不删内容 ---
+# demote（默认）：权重跌破侵蚀线 → 只钉在 HUSK_W、标 erase_stage=3（降权空壳），
+#   正文/动词/宾语一个字不动，检索自然沉底；再被召回或晋升 core 还能浮起来。
+#   —— 老大要求：绝不许随机忘掉说过的话（core 层本来就不吃侵蚀，这里保的是 mid 层）。
+# physical：作者原版三级随机侵蚀（擦动词→擦宾语→整条删除，走 _forget_row 台账）。
+# 环境变量 WHALE_ERASE_MODE=physical 可切回原版。
+ERASE_STAGE_DEMOTED = 3
+ERASE_MODE = (os.environ.get("WHALE_ERASE_MODE") or "demote").strip().lower()
+
 # --- 媒体记忆（画面）：2026-11-02，设计见 docs/MEDIA-MEMORY.md ---
 # 文字是主干，画面是快照：**两条寿命，各自风化**，只用索引相连，寿命不互传。
 # 形状用幂律而不是指数——艾宾浩斯 1885 那组数据（20 分 58.2% / 1 天 33.7% /
@@ -2411,6 +2420,16 @@ class MemoryCard:
             wn = wn_row(r, now)
             if wn >= ERASE_W_FLOOR:
                 continue
+            if ERASE_MODE == "demote":
+                # 拔刺版（大肥鱼 2026-11-02）：不掷骰子、不擦内容，
+                # 只把这条钉成降权空壳——检索沉底，但数据永远在。幂等。
+                stage = r["erase_stage"] if "erase_stage" in r.keys() else 0
+                if stage >= ERASE_STAGE_DEMOTED:
+                    continue
+                c.execute("UPDATE mem SET erase_stage=?, w=?, t_anchor=? WHERE id=?",
+                          (ERASE_STAGE_DEMOTED, HUSK_W, now, r["id"]))
+                events.append((r["id"], "demoted", None))
+                continue
             p = P_ERASE_MAX * (1.0 - wn / ERASE_W_FLOOR)
             if random.random() >= p:
                 continue
@@ -4112,8 +4131,10 @@ class MemoryCard:
             bits.append(parts["PLACE"][0])
         core = mem_row["core"]
         # 🔧 V5.0 T2-1：主干被侵蚀过的话，按阶段渲染残缺的主干
+        # 🔧 拔刺版（大肥鱼 2026-11-02）：stage=3 是「降权空壳」不是残缺，
+        #    内容原样，照常全文渲染，只是检索权重沉底。
         _stage = mem_row["erase_stage"] if "erase_stage" in mem_row.keys() else 0
-        if _stage:
+        if _stage in (ERASE_STAGE_VERB, ERASE_STAGE_OBJ):
             _subj = mem_row["subj"] if "subj" in mem_row.keys() else ""
             _verb = mem_row["verb"] if "verb" in mem_row.keys() else ""
             _obj = mem_row["obj"] if "obj" in mem_row.keys() else ""

@@ -10,10 +10,14 @@ import random
 import sys
 import tempfile
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import card2
 from card2 import (split_predicate, render_predicate, DAY, POOL_SHORT,
                    ERASE_STAGE_VERB, ERASE_STAGE_OBJ)
+
+# 拔刺改造（大肥鱼 2026-11-02）：本文件专测作者原版的三级侵蚀机制，
+# fork 默认 ERASE_MODE="demote" 已不删内容，这里显式锁回 physical 模式。
+card2.ERASE_MODE = "physical"
 
 
 def main():
