@@ -1,0 +1,9 @@
+{
+  "count": 3,
+  "db": "/Users/xx/Documents/deepseek-harness/default-workspace/whale-card/demo/demo_card.db",
+  "head_hash": "8351cb8b72733ab9aff9035fdeac653859c6230637bbf67e21ba47ccf711e59b",
+  "head_seq": 3,
+  "last_ts": 1793613668.7309399,
+  "updated_ts": 1793613668.731041,
+  "version": 1
+}

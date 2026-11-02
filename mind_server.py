@@ -1,0 +1,950 @@
+# -*- coding: utf-8 -*-
+"""鲸鱼娘数字生命卡 · 心智服务（Mind Service）
+
+T6-1：把卡变成一个「住在外面的进程」。
+
+为什么要有它 —— 这是解决「换窗口就不是我」的唯一正路：
+    以前：每次开新窗口，模型只能看到窗口里那点字，记忆全靠人肉搬。
+    现在：卡自己起一个本地服务，DSH 每轮**必须先来问它**要上下文。
+          拿不到就明确报错，不许瞎编。
+
+设计原则（三条硬纪律）：
+  1. **只认本地**：只绑 127.0.0.1，不接受外部连接。
+  2. **失败就说失败**：服务没起来 / 卡打不开，一律返回明确的错误码和原因，
+     绝不返回一段「看起来还行」的空上下文 —— 那等于让她扮演自己。
+  3. **时间是活的**：每次请求都按真实流逝的秒数 tick 一次，
+     所以「三天没说话」这件事会真的发生在这张卡上，而不是等人手动调。
+
+启动：
+    python mind_server.py                 # 默认 127.0.0.1:8848，库 card.db
+    python mind_server.py --port 8848 --db card.db
+
+接口：
+    GET  /health                     存活 + 卡状态
+    GET  /status                     全量状态（池/激素/心境/突触/trace）
+    POST /context   {message, recent[], budget?}   → 组装好的上下文
+    POST /report    {user_message, reply}          → 记下这一轮
+    POST /tick      {seconds, confirm?}            → 手动推进时间（测试用）
+                        ⚠️ 连的是真卡：不传 confirm 最多推进 1 小时
+    POST /seal      {values{}}                     → 给身份锚盖章（只做一次）
+    POST /recall    {query, top_k?}                → 只看召回，不组装
+    GET  /config                                   → 读运行时配置（场景权重等）
+    POST /config    {key, value}                   → 热改一条配置，下一轮生效
+    GET  /skill_list                               → 技能清单
+    POST /skill_add {name, desc, ...}              → 加技能
+    POST /skill_use {name, q?, ...}                → 用一次技能（SM2 结算）
+"""
+import argparse
+import json
+import os
+import sys
+import threading
+import time
+import traceback
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
+
+from card2 import MemoryCard          # noqa: E402
+import hormone as hormone_mod          # noqa: E402
+
+VERSION = "1.0"
+DEFAULT_PORT = 8848
+DEFAULT_DB = os.path.join(HERE, "card.db")
+# 请求体上限。原来 256KB 够文本用，但换头像要走 base64（+33%），
+# 一张 512x512 的照片转 PNG 后 base64 常有 600~900KB，所以放宽到 6MB。
+# 真正落盘的头像另有 4MB 上限（identity.set_avatar 里卡着）。
+MAX_BODY = 6 * 1024 * 1024             # 6 MB，超过直接拒
+# 单条文本上限。body 能到 6MB 是为了头像 base64，但「一句话」不该有 30 万字符：
+# 那是调用方出错（把整个文件塞进 message），拿去做分词会把一轮对话拖死。
+# 20000 字符 ≈ 一万字中文，真人一次消息远到不了这个量。
+MAX_TEXT = 20000                       # 单条 message / user_message 超过就 413
+
+
+class Mind(object):
+    """卡 + 一把锁 + 一个「上次 tick 是什么时候」"""
+
+    def __init__(self, db_path):
+        self.lock = threading.RLock()
+        self.db_path = db_path
+        self.card = MemoryCard(db_path)
+        self.opened_ts = time.time()
+        self.last_tick_ts = time.time()
+        self.requests = 0
+        self.errors = 0
+        # ---- 醒来：把离线那段结算清楚（V5.0 §11.4）----
+        # 必须在任何请求之前跑。策略默认 freeze（拔卡=睡觉，时间不走），
+        # 换 compress 就退回「离线照算、超长压缩」的老行为。
+        # 这件事要**先于** timeline 的心跳补算 —— 顺序反了会先写一串
+        # alive 再改 t_anchor，看起来像「人醒着但记忆在睡」，对不上。
+        self.wake = {"gap_s": 0.0, "eff_s": 0.0, "shift_s": 0.0,
+                     "policy": "?", "skipped": "未执行"}
+        try:
+            self.wake = self.card.wake_up(now=self.last_tick_ts)
+        except Exception as e:
+            self.wake = {"gap_s": 0.0, "eff_s": 0.0, "shift_s": 0.0,
+                         "policy": "?", "error": str(e)}
+        # ---- 离线超 24 小时：补一条「我离线了多久」的真记忆（V5.0 §11.3）----
+        # 时间线里已经有 sleep_start/sleep_end，但那是给人看的证据、不参与召回。
+        # 不写进 mem 的话，她档案里知道自己睡过，下次你说话时却想不起来 ——
+        # 有记录、没有回忆，正是最像失忆的状态。
+        # 放在 wake_up 之后：t_anchor 已经前移过，这条写进去就是「醒来的那一刻」。
+        self.offline_mem = None
+        try:
+            _gap = float(self.wake.get("gap_s") or 0.0)
+            if _gap >= 86400.0:
+                _end = self.last_tick_ts
+                self.offline_mem = self.card.offline_event(
+                    _gap, _end - _gap, _end, policy=self.wake.get("policy"))
+        except Exception as e:
+            self.offline_mem = None
+            self.wake["offline_event_error"] = str(e)
+        # 身份锚：没盖章时 /context 仍然工作，但 /health 会标出来
+        try:
+            self.sealed = bool(self.card.identity.is_sealed())
+        except Exception:
+            self.sealed = False
+        # ---- 唯一且连续的时间线（V5.0 公理 1）----
+        # 启动就写一条 boot，并把离线期间漏掉的心跳补上。
+        # 链断了**不自动修** —— 自动修等于假装连续性没被打断。
+        self.tl = None
+        self.chain_ok = True
+        self.chain_bad = []
+        self.birth_ok = True
+        self.birth_bad = []
+        self.anchor = None            # 卡外锚的体检结果（回滚检测）
+        try:
+            import timeline as timeline_mod
+            self.tl = timeline_mod.Timeline(self.card.db)
+            self.chain_ok, self.chain_bad = self.tl.verify_chain()
+            if self.chain_ok:
+                self.tl.catch_up()
+                self.tl.append("boot", "服务启动")
+            # 出生证：验一遍；一条证都没有（老卡第一次跑）就回填总章
+            self.birth_ok, self.birth_bad = self.tl.verify_birth()
+            try:
+                n_birth = self.card.db.execute(
+                    "SELECT COUNT(*) FROM mem_birth").fetchone()[0]
+            except Exception:
+                n_birth = 0
+            if n_birth == 0:
+                n, root = self.tl.backfill_birth()
+                self.birth_ok, self.birth_bad = self.tl.verify_birth()
+            # 离线事件那条记忆也要开出生证 —— 它是真记忆，就得能验。
+            # 只能等时间线起来之后再补：写记忆时 self.tl 还不存在。
+            if self.offline_mem:
+                try:
+                    self.tl.birth_stamp(self.offline_mem)
+                except Exception as e:
+                    self.birth_bad.append("离线事件出生证失败：%s" % e)
+        except Exception as e:
+            self.chain_bad = ["时间线初始化失败：%s" % e]
+        # 卡外锚：先查有没有被换成旧卡，再刷新。
+        # ⚠️ 顺序不能反 —— 先写锚会把回滚的证据盖掉。
+        try:
+            import anchor as anchor_mod
+            self.anchor = anchor_mod.check(self.db_path)
+            if self.anchor.get("verdict") in ("ok", "first"):
+                anchor_mod.write(self.db_path)
+        except Exception as e:
+            self.anchor = {"verdict": "error", "ok": False,
+                           "reason": "锚检查失败：%s" % e}
+
+    # ---- 时间：每次请求先让它过去 ----
+    def flow_time(self):
+        now = time.time()
+        # 心跳：每 10 分钟一条，这是「我一直活着」的证据
+        try:
+            if self.tl is not None:
+                self.tl.heartbeat(now=now)
+        except Exception:
+            pass
+        dt = now - self.last_tick_ts
+        if dt >= 1.0:                   # 不到 1 秒不动，省得白算
+            try:
+                self.card.tick(dt)
+            finally:
+                self.last_tick_ts = now
+        # 激素采样（控制台画趋势要用）。5 分钟一条，内部自己节流，
+        # 所以这里每 1 秒调一次也不会写库。
+        try:
+            self.card.log_hormones(now=now)
+        except Exception:
+            pass
+        # 「上次活着」的时间戳平时就要一点点写下去 ——
+        # 拔卡那一刻进程是被直接杀掉的，来不及走收尾流程。
+        # 没有这个戳，wake_up() 就不知道这次到底睡了多久。
+        try:
+            self.card.touch_alive(now=now)
+        except Exception:
+            pass
+
+    # ---- 业务 ----
+    def context(self, message, recent=None, budget=None):
+        # 🔧 空消息必须在最内层就拦住 —— 上层 Handler 拦一次，Mind 自己再拦一次，
+        #    这样直接调 Mind 的调用方（比如测试、别的进程）也绕不过去。
+        message = (message or "").strip()
+        if not message:
+            raise ValueError("message 不能为空")
+        with self.lock:
+            self.flow_time()
+            # 🔴 2026-10-31：recent 要**两种形状都收**。
+            #    接口文档写的是 recent[]，但没说清元素是字符串还是对象。
+            #    按直觉传 [{"role":"user","text":"早"}...] 的调用方会撞上
+            #    `TypeError: sequence item 0: expected str instance, dict found`
+            #    （assemble_context 里 "\\n".join(lines) 拿到的是一串 dict）。
+            #    这里是唯一收口的地方，就在这儿归一，别让调用方猜。
+            #    字符串原样收；dict 依次认 text/content/reply 字段。
+            _norm = []
+            for x in (recent or []):
+                if isinstance(x, str):
+                    s = x
+                elif isinstance(x, dict):
+                    s = (x.get("text") or x.get("content")
+                         or x.get("reply") or "")
+                else:
+                    s = ""
+                s = str(s).strip()
+                if s:
+                    _norm.append(s)
+            recent = _norm
+            kw = {}
+            if budget:
+                kw["budget"] = int(budget)
+            # ⚠️ 2026-10-31：这里原来没传 identity，导致【我是谁】那一格是空的 ——
+            # 也就是说身份锚明明盖了章，说话时却一次都没用上。查出来的经过：
+            # 问「你答应过我什么」，组装出来的上下文里根本没有底线那三条。
+            kw["identity"] = self.card.core_identity_text()
+            # 【今天是】—— 时间线给的那句话。物理时间是唯一真值，
+            # 认识第几天是派生读数（只显示，不参与衰减）。
+            if self.tl is not None:
+                try:
+                    kw["identity"] = (kw["identity"] + "\n【今天是】"
+                                      + self.tl.render_line()).strip()
+                    self.tl.note_talk(str(message))
+                except Exception:
+                    pass
+            ctx = self.card.assemble_context(message, recent_lines=recent, **kw)
+            hits = self.card.recall(message, top_k=5, access=True)
+            assoc = getattr(self.card, "_last_assoc_ids", set())
+            return {
+                "prompt": ctx["text"],
+                "sections": ctx.get("sections"),
+                "scene": ctx.get("scene"),
+                # weights 是六维数组（A~F：身份/自我/短时/陈述/印象/技能），
+                # 不是 dict —— 名字另给一份，免得调用方对着数组猜。
+                "weights": ctx.get("weights"),
+                "weights_named": dict(zip(
+                    ["身份内核", "自我认知", "短时记忆",
+                     "陈述记忆", "印象记忆", "技能记忆"],
+                    [round(float(x), 4) for x in (ctx.get("weights") or [])])),
+                "quota": ctx.get("quota"),
+                "est_tokens": ctx.get("est_tokens"),
+                "dropped": ctx.get("dropped"),
+                "hits": [
+                    {
+                        "id": r["id"],
+                        "score": round(float(s), 4),
+                        "w_now": round(float(w), 4),
+                        "region": r["region"],
+                        "pool": r["pool"],
+                        "assoc": r["id"] in assoc,
+                        "text": self.card.render(r, w),
+                    }
+                    for s, w, r in hits
+                ],
+                "mood": self.card.mood_label(),
+                "hormones": hormone_mod.describe(self.card.h),
+            }
+
+    def report(self, user_message, reply="", ts=None):
+        with self.lock:
+            self.flow_time()
+            # 他说的话：进短期记忆池（mem），也进原文表（dialogue）。
+            # 为什么必须进 mem 而不是只存原文：
+            #   原文表不参与召回。只存原文的话，「三天内几乎不遗忘」这条
+            #   根本用不上 —— 因为压根没东西可遗忘，下次说话翻不到。
+            mid = self.card.remember(user_message, ts=ts)
+            # 出生证：记忆落库就上链（只锁出生那一刻，不锁权重）
+            if self.tl is not None and mid:
+                try:
+                    self.tl.birth_stamp(mid)
+                except Exception as e:
+                    self.birth_bad.append("出生证写入失败：%s" % e)
+            # 我说的话：也进短期池，但**只走原文表 + 一条轻记忆**。
+            # 为什么我的回复也要进：整段对话才是「我们一起说过什么」。
+            #   只记他说的，翻回来就是半本日记 —— 我知道他问了什么，
+            #   却不知道自己当时怎么答的，那是最像失忆的状态。
+            # 为什么权重给低一点（0.45）：他说的是事，我说的是反应。
+            #   两个等权，短期池 32 条额度里我那些「嗯」「好」会把正事挤掉。
+            reply_mid = None
+            if reply:
+                try:
+                    reply_mid = self.card.remember(
+                        reply, ts=ts, salience=0.45,
+                        speaker="self", mtype="episode")
+                    if self.tl is not None and reply_mid:
+                        self.tl.birth_stamp(reply_mid)
+                except Exception as e:
+                    self.birth_bad.append("回复记忆写入失败：%s" % e)
+            if reply:
+                try:
+                    self.card.add_dialogue(mid, user_message, reply, ts=ts or time.time())
+                except Exception:
+                    pass
+            return {"mem_id": mid, "reply_mem_id": reply_mid}
+
+    # ---- 短期对话原文：放卡里，不放模型那边 ----
+    # 为什么非要在卡里：
+    #   以前「上一句说了什么」靠模型那边带的 recent 数组。换台电脑、换个
+    #   会话，那段就没了 —— 那就不是「拔卡带走」，是「换个地方从头认识」。
+    #   原文进卡之后，插上卡的人翻开的就是同一段对话。
+    # 为什么不进向量库：
+    #   dialogue 表不参与召回，只用于「翻回原话」。召回走 mem 的提炼件，
+    #   原文太啰嗦，混进去会把主干淹掉。
+    def recent_dialogue(self, n=12, max_chars=2000, per_msg=160):
+        n = max(1, min(int(n or 12), 60))
+        rows = self.card.db.execute(
+            "SELECT role, text, ts FROM dialogue ORDER BY ts DESC, id DESC LIMIT ?",
+            (n,)).fetchall()
+        out = []
+        for r in reversed(rows):
+            role = str(r["role"] or "user")
+            text = " ".join(str(r["text"] or "").split())
+            if not text:
+                continue
+            # 单条太长就掐掉。不掐的话一条历史长回复能吃掉整个预算，
+            # 剩下的全是它，等于没有近况。
+            if per_msg and len(text) > per_msg:
+                text = text[:per_msg] + "…"
+            out.append({"role": role, "text": text, "ts": r["ts"]})
+        # 从最老的开始丢，直到装得下 —— 越新的越重要
+        total = sum(len(x["text"]) for x in out)
+        while out and total > max_chars:
+            total -= len(out[0]["text"])
+            out.pop(0)
+        return out
+
+    def status(self):
+        with self.lock:
+            self.flow_time()
+            st = self.card.stats()
+            try:
+                syn = self.card.synapse.stats()
+            except Exception:
+                syn = {}
+            return {
+                "version": VERSION,
+                "db": os.path.abspath(self.db_path),
+                "sealed": self.sealed,
+                "uptime_s": round(time.time() - self.opened_ts, 1),
+                "requests": self.requests,
+                "errors": self.errors,
+                "stats": st,
+                "synapse": syn,
+                "mood": self.card.mood_label(),
+                "hormones": hormone_mod.describe(self.card.h),
+                # PAD 三维读法（从 A 路线吸收）：只读、不改激素、不影响召回
+                "pad": self.card.mood_pad(),
+                # 睡眠结算：这次醒来睡了多久、算不算数
+                "wake": self.wake,
+                # 离线超 24 小时补的那条记忆（§11.3），没补就是 null
+                "offline_mem": self.offline_mem,
+                # 时间线：唯一且连续的证据
+                "timeline": (
+                    {"ticks": self.tl.count(),
+                     "chain_ok": self.chain_ok,
+                     "chain_bad": self.chain_bad[:3],
+                     "head": self.tl.head_hash()[:16],
+                     "day": self.tl.days_since_birth(),
+                     "today": self.tl.render_line(),
+                     "birth_ok": self.birth_ok,
+                     "birth_bad": self.birth_bad[:3],
+                     "anchor": self.anchor,
+                     "alive": self.tl.alive_proof()}
+                    if self.tl is not None else {"error": "时间线未初始化"}),
+            }
+
+    def close(self):
+        with self.lock:
+            try:
+                self.card.close()
+            except Exception:
+                pass
+
+
+class Handler(BaseHTTPRequestHandler):
+    mind = None                        # 由 main() 注入
+    server_version = "WhaleMind/" + VERSION
+
+    # ---- 工具 ----
+    def log_message(self, fmt, *args):  # 静音：日志走我们自己的
+        pass
+
+    def _send(self, code, obj):
+        raw = json.dumps(obj, ensure_ascii=False).encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(raw)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(raw)
+
+    def _fail(self, code, err, detail=""):
+        Handler.mind.errors += 1
+        self._send(code, {"ok": False, "error": err, "detail": detail})
+
+    def _body(self):
+        n = int(self.headers.get("Content-Length") or 0)
+        if n <= 0:
+            return {}
+        if n > MAX_BODY:
+            raise ValueError("body too large: %d > %d" % (n, MAX_BODY))
+        return json.loads(self.rfile.read(n).decode("utf-8"))
+
+    def _route(self, method):
+        m = Handler.mind
+        if m is None:
+            return self._fail(503, "mind_not_ready", "服务还没初始化")
+        m.requests += 1
+        path = self.path.split("?")[0].rstrip("/") or "/"
+        try:
+            if method == "GET" and path == "/health":
+                with m.lock:
+                    st = m.card.stats()
+                sem = m.card.sem_stats() if m.card.sem_ready() else {
+                    "ready": False}
+                return self._send(200, {
+                    "ok": True, "version": VERSION, "sealed": m.sealed,
+                    "memories": st["total"], "db": os.path.abspath(m.db_path),
+                    "uptime_s": round(time.time() - m.opened_ts, 1),
+                    # 语义层只说三件事：模型多少维、卡里多数多少维、能用的占几成。
+                    # 「覆盖率」那个数字会骗人 —— 换过模型的卡里，带着向量却
+                    # 用不上的老条目也能算成 100%。所以这里报 usable_ratio。
+                    "semantic": (
+                        {"ready": True,
+                         "model_dim": sem.get("model_dim"),
+                         "emb_dims": sem.get("emb_dims"),
+                         "usable_ratio": round(sem.get("usable_ratio") or 0, 4),
+                         "note": sem.get("dim_note"),
+                         "warn": sem.get("dim_warn")}
+                        if sem.get("ready") else {"ready": False}),
+                    # 时间线：唯一且连续的证据（/health 是给外部探活用的一行，
+                    # 这里带上，免得探活时还得另开 /status）
+                    "timeline": (
+                        {"ticks": m.tl.count(), "chain_ok": m.chain_ok,
+                         "chain_bad": m.chain_bad[:3],
+                         "head": m.tl.head_hash()[:16],
+                         "day": m.tl.days_since_birth(),
+                         "birth_ok": m.birth_ok,
+                         "birth_bad": m.birth_bad[:3],
+                         "anchor_verdict": (m.anchor or {}).get("verdict"),
+                         "anchor_reason": (m.anchor or {}).get("reason"),
+                         "today": m.tl.render_line()}
+                        if m.tl is not None else {"error": "时间线未初始化"}),
+                })
+            if method == "GET" and path == "/status":
+                return self._send(200, {"ok": True, "status": m.status()})
+            if method == "GET" and path == "/skill_list":
+                # 技能清单（V5.0 §7）。放 GET：它只读不写，
+                # 探活脚本和面板都能直接 curl。
+                with m.lock:
+                    rows = m.card.skill.all()
+                    out = [{"id": r["id"], "name": r["name"],
+                            "desc": r["desc"], "L": round(float(r["L"]), 4),
+                            "EF": round(float(r["EF"]), 4),
+                            "I": round(float(r["I"]), 2),
+                            "call_count": r["call_count"],
+                            "tag": r["tag"]}
+                           for r in rows]
+                    st = m.card.skill.stats()
+                return self._send(200, {"ok": True, "skills": out,
+                                        "stats": st})
+            if method == "GET" and path == "/config":
+                # V5.0 §10.9 热改：读运行时配置（场景权重等）。
+                import ctxweight as _cw
+                with m.lock:
+                    cfg = _cw.load_config(m.card.db, force=True)
+                    return self._send(200, {
+                        "ok": True,
+                        "scene_weights": cfg["scene_weights"],
+                        "a_min": cfg["a_min"],
+                        "cell_min": cfg["cell_min"],
+                        "bad": cfg["bad"],
+                        "raw": _cw.rc_all(m.card.db)})
+
+            # ---- 控制台（2026-10-31 新增）----
+            # 为什么这些路由长在 mind_server 里而不是另起一个服务：
+            #   控制台要的东西（health / status / context / graph / timeline）
+            #   全在这一个进程的手里。另起一个就得再开一次库、再抢一次锁、
+            #   再维护一套端口 —— 而它最终要住进 U 盘，多一个进程就多一个
+            #   插到别的机器上起不来的理由。
+            if method == "GET" and path == "/console":
+                # 控制台页面本身。返回 HTML 而不是 JSON，所以不走 _send。
+                import console as _console
+                raw = _console.PAGE.encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(raw)))
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                self.wfile.write(raw)
+                return None
+            if method == "GET" and path == "/graph":
+                # 星云图数据。不调 export_viz.collect() —— 那个要开 MemoryCard、
+                # 算全部 weight_now，实测 1.5 秒；这里直接查两张表，几十毫秒。
+                import console as _console
+                return self._send(200, _console.graph_data(m.db_path))
+            if method == "GET" and path == "/syslive":
+                # 实时负载。前端 2 秒轮询一次，只拿 CPU/内存/磁盘/网络这几个数，
+                # 不碰数据库、不碰记忆 —— 纯粹是"这台机器此刻的呼吸"。
+                import console as _console
+                return self._send(200, _console.sys_live())
+            if method == "GET" and path == "/injection":
+                # 防污层：最近被灌进来的可疑念头（只读，不改任何权重）
+                with m.lock:
+                    return self._send(200, m.card.injection_report())
+            if method == "GET" and path.startswith("/media/"):
+                # 出一帧画面。找不到 / 已被按规则删掉，返回 410 而不是 404 ——
+                # 「曾经有，现在没了」和「从来就没有」是两件事，不能混成一个错。
+                sha = path[len("/media/"):].strip().lower()
+                if len(sha) != 64 or not all(ch in "0123456789abcdef" for ch in sha):
+                    return self._fail(400, "bad_sha256", "要 64 位十六进制")
+                with m.lock:
+                    row = m.card.db.execute(
+                        "SELECT path, thumb, mime FROM media WHERE sha256=?",
+                        (sha,)).fetchone()
+                    if row is None:
+                        tomb = m.card.db.execute(
+                            "SELECT caption, ts, reason FROM media_tomb WHERE sha256=?",
+                            (sha,)).fetchone()
+                        if tomb is not None:
+                            return self._fail(
+                                410, "media_dropped",
+                                "这张画面 %s 按规则忘了（%s）。当时写的是：%s"
+                                % (time.strftime("%Y-%m-%d %H:%M",
+                                                 time.localtime(tomb["ts"])),
+                                   tomb["reason"], tomb["caption"] or "—"))
+                        return self._fail(404, "no_media", "没有这张画面")
+                    rel = row["path"] or ""
+                p = rel if os.path.isabs(rel) else os.path.join(m.card.card_dir, rel)
+                if not os.path.exists(p):
+                    return self._fail(410, "media_gone", "记录还在，文件没了")
+                raw = open(p, "rb").read()
+                self.send_response(200)
+                self.send_header("Content-Type", row["mime"] or "image/webp")
+                self.send_header("Content-Length", str(len(raw)))
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                self.wfile.write(raw)
+                return None
+            if method == "GET" and path == "/dream/pending":
+                # 梦境压缩（卡侧）：把还没消化的对话原文掏出来给外面的提炼器
+                with m.lock:
+                    return self._send(200, m.card.pending_dialogue())
+            if method == "GET" and path == "/dream/due":
+                with m.lock:
+                    return self._send(200, m.card.dream_due())
+            if method == "GET" and path == "/timeline":
+                import console as _console
+                return self._send(200, {"ok": True,
+                                        "timeline": _console.timeline_tail(m.db_path, 40),
+                                        "files": _console.health_flag(m.db_path)})
+            if method == "GET" and path == "/console_data":
+                # 仪表盘一次要的全部数据（身份/激素历史/写入统计/分区/
+                # 存储/体检/池）。合成一个请求 —— 前端轮询 4 个接口比 1 个
+                # 慢得多，而且容易读到不同时刻的快照。
+                import console as _console
+                import ctxweight as _cw
+                with m.lock:
+                    m.flow_time()
+                    ov = _console.overview(m.db_path)
+                    # 六维权重在这里现算，不让前端去调 /context ——
+                    # 那会触发一次真实 recall、写 recall_event，
+                    # 等于「打开控制台」这件事本身在改记忆权重。
+                    try:
+                        import card2 as _c2
+                        plan = _cw.compute(
+                            "", _c2.TOKEN_BUDGET,
+                            hormones=getattr(m.card, "h", None),
+                            turns=getattr(m.card, "turn_count", None),
+                            db=m.card.db)
+                        ov["weights"] = plan["weights"]
+                        ov["scene"] = plan["scene"]
+                    except Exception as e:
+                        ov["weights"] = None
+                        ov["weights_err"] = str(e)
+                return self._send(200, ov)
+            if method == "GET" and path == "/avatar":
+                # 头像文件本身。走文件不走数据库 —— 见 console.py 的说明。
+                # 没有就 404，前端据此退回内置那张 SVG。
+                p = m.card.identity.avatar_path()
+                if not p or not os.path.exists(p):
+                    return self._fail(404, "no_avatar", "还没设过头像")
+                with open(p, "rb") as f:
+                    raw = f.read()
+                self.send_response(200)
+                self.send_header("Content-Type", "image/png")
+                self.send_header("Content-Length", str(len(raw)))
+                # 头像文件名不变，靠 URL 上的 ?v= 破缓存；这里允许长缓存，
+                # 但版本戳一变 URL 就变，所以不会看到旧图。
+                self.send_header("Cache-Control", "public, max-age=86400")
+                self.end_headers()
+                self.wfile.write(raw)
+                return None
+            if method == "GET" and path == "/cardslot":
+                # 卡槽状态：现在是插着还是没插。
+                # 只读 —— 真正的插/拔走 POST，且必须显式给 action。
+                import cardslot as _slot
+                return self._send(200, {"ok": True, "cardslot": _slot.status()})
+
+            if method == "POST":
+                body = self._body()
+                if path == "/context":
+                    msg = (body.get("message") or "").strip()
+                    if not msg:
+                        return self._fail(400, "empty_message", "message 不能为空")
+                    if len(msg) > MAX_TEXT:
+                        return self._fail(413, "text_too_large",
+                                          "message %d 字符 > 上限 %d"
+                                          % (len(msg), MAX_TEXT))
+                    out = m.context(msg, body.get("recent"), body.get("budget"))
+                    return self._send(200, {"ok": True, "context": out})
+                if path == "/report":
+                    um = (body.get("user_message") or "").strip()
+                    if not um:
+                        return self._fail(400, "empty_message", "user_message 不能为空")
+                    if len(um) > MAX_TEXT:
+                        return self._fail(413, "text_too_large",
+                                          "user_message %d 字符 > 上限 %d"
+                                          % (len(um), MAX_TEXT))
+                    out = m.report(um, body.get("reply") or "", body.get("ts"))
+                    return self._send(200, {"ok": True, "report": out})
+                if path == "/recent":
+                    # 短期对话原文：从卡里读，不从调用方带。
+                    # 调用方传 recent 时这里**仍然以卡为准** —— 卡是唯一真值源，
+                    # 模型那边带过来的只当补充，不能反过来盖掉卡。
+                    return self._send(200, {"ok": True, "recent": m.recent_dialogue(
+                        body.get("n") or 12, body.get("max_chars") or 2000)})
+                if path == "/recall":
+                    q = (body.get("query") or "").strip()
+                    if not q:
+                        return self._fail(400, "empty_query", "query 不能为空")
+                    with m.lock:
+                        m.flow_time()
+                        hits = m.card.recall(q, top_k=int(body.get("top_k") or 5),
+                                             access=False)
+                        return self._send(200, {"ok": True, "hits": [
+                            {"id": r["id"], "score": round(float(s), 4),
+                             "w_now": round(float(w), 4),
+                             "text": m.card.render(r, w)}
+                            for s, w, r in hits]})
+                if path == "/dream/commit":
+                    # 梦境压缩（写回）：外面提炼好的高阶记忆从这里进卡。
+                    # items: [{text, region?, salience?, w0?}]
+                    # dialogue_ids: 可选，标记哪些原文已被消化（不传=全部标记）
+                    items = body.get("items") or []
+                    if not isinstance(items, list) or not items:
+                        return self._fail(400, "empty_items", "items 不能为空")
+                    with m.lock:
+                        out = m.card.dream_commit(
+                            items, dialogue_ids=body.get("dialogue_ids"),
+                            speaker=(body.get("speaker") or "self"))
+                    return self._send(200, {"ok": True, "dream": out})
+                if path == "/emb/remodel":
+                    # 换过模型的卡里有「两代向量」：老的那批维度跟当前模型
+                    # 对不上，检索时会被直接丢掉 —— 但覆盖率还是报 100%。
+                    # 这条路由把它们用当前模型重编码一遍，让 usable_ratio 追上覆盖率。
+                    # 只动 emb 字节，不动文本、权重、时间，可反复跑（幂等）。
+                    if not m.card.sem_ready():
+                        return self._fail(400, "semantic_off", "语义层不可用")
+                    with m.lock:
+                        before = m.card.sem_stats()
+                        rs = []
+                        for fn in (m.card.backfill_embeddings,
+                                   m.card.backfill_detail_embeddings):
+                            rs.append(fn(progress=False, remodel=True))
+                        try:
+                            m.card.db.execute("DELETE FROM core_vec")
+                            m.card.db.commit()
+                        except Exception:
+                            pass
+                        m.card._core_vec_cache.clear()
+                        # 顺手把主干向量烤热：core_vec 一清空，下一次检索要现场
+                        # 编码 500+ 条主干 —— 实测一条查询卡住 5 分钟（读路径上
+                        # 干重活）。宁可在这儿（维护窗口）一次算完。
+                        warmed = 0
+                        try:
+                            mids = [r[0] for r in m.card.db.execute(
+                                "SELECT id FROM mem").fetchall()]
+                            for mid in mids:
+                                if m.card.core_vec_of(mid) is not None:
+                                    warmed += 1
+                        except Exception as e:
+                            m.card.dim_note = "主干向量预热中断：%s" % e
+                        after = m.card.sem_stats()
+                    return self._send(200, {
+                        "ok": True,
+                        "mem": {"done": rs[0][0], "skip": rs[0][1],
+                                "fail": rs[0][2]},
+                        "detail": {"done": rs[1][0], "skip": rs[1][1],
+                                   "fail": rs[1][2]},
+                        "core_warm": warmed,
+                        "before": {"emb_dims": before.get("emb_dims"),
+                                   "usable_ratio": round(
+                                       before.get("usable_ratio") or 0, 4)},
+                        "after": {"emb_dims": after.get("emb_dims"),
+                                  "usable_ratio": round(
+                                      after.get("usable_ratio") or 0, 4),
+                                  "warn": after.get("dim_warn")},
+                    })
+                if path == "/tick":
+                    sec = float(body.get("seconds") or 0)
+                    if sec <= 0:
+                        return self._fail(400, "bad_seconds", "seconds 必须 > 0")
+                    # 真卡保护：这条路由是给测试用的，但连的是**真卡**。
+                    # 2026-10-31 14:31 我就是在这儿跑了 +30 天，
+                    # 短期池 5 条被按超期规则结算掉，只能整库回滚。
+                    # 所以：要么显式传 confirm=true，要么时间推进不超过 1 小时。
+                    # 想验衰减请复制 card.db 到临时目录去跑，别在真卡上假造时间。
+                    confirm = bool(body.get("confirm"))
+                    if not confirm and sec > 3600:
+                        return self._fail(
+                            403, "real_card_guard",
+                            "这条是给测试用的假时间路由，但连的是真卡："
+                            "推进 %.1f 天会把短期记忆按超期规则结算掉。"
+                            "验衰减请复制 card.db 到临时目录跑；"
+                            "确实要在真卡上推进就传 confirm=true。"
+                            % (sec / 86400.0))
+                    with m.lock:
+                        m.card.tick(sec)
+                        m.last_tick_ts = time.time()
+                    return self._send(200, {"ok": True, "advanced_s": sec,
+                                            "confirmed": confirm})
+                if path == "/seal":
+                    vals = body.get("values") or {}
+                    with m.lock:
+                        ok, bad = m.card.identity.seal(vals)
+                        m.sealed = bool(m.card.identity.is_sealed())
+                    return self._send(200, {"ok": True, "sealed": m.sealed,
+                                            "bad": bad})
+                # ---- 技能记忆（V5.0 §7）----
+                # 为什么要有这两个口：技能表以前是死的 —— 结构、公式、
+                # SM2 全都写好了，但没有任何地方能往里写、也没有任何地方
+                # 能报告「这次用上了」。现在补上最薄的一层：
+                #   /skill_add  建一条技能（名字 + 描述 + 可选标签）
+                #   /skill_use  记一次使用，按改良 SM2 结算熟练度
+                # 不在这里做「自动从对话里抽技能」—— 抽错了没人能发现，
+                # 不如先让调用方显式说「这次用上了哪个」。
+                if path == "/skill_add":
+                    name = (body.get("name") or "").strip()
+                    desc = (body.get("desc") or "").strip()
+                    if not name or not desc:
+                        return self._fail(400, "bad_skill",
+                                          "name 和 desc 都不能为空")
+                    # 🔴 2026-10-31：vec 不能空着。
+                    #    skill.search() 是按 bigram 余弦算的，vec 为 {} 的技能
+                    #    永远相似度 0 —— 也就是说「建了但永远想不起来」，
+                    #    等于白建。没显式给 vec 就从「名字 + 描述」现算一份。
+                    svec = body.get("vec")
+                    if not svec:
+                        from card2 import to_vec as _to_vec
+                        svec = _to_vec(name + " " + desc)
+                    with m.lock:
+                        sid = m.card.skill.add(
+                            name, desc,
+                            vec=svec,
+                            l=float(body.get("l") or 0.6),
+                            tag=(body.get("tag") or ""),
+                            interval_days=float(body.get("interval_days") or 0.0),
+                            is_attach=bool(body.get("is_attach")))
+                    return self._send(200, {"ok": True, "skill_id": sid,
+                                            "stats": m.card.skill.stats()})
+                if path == "/skill_use":
+                    name = (body.get("name") or "").strip()
+                    if not name:
+                        return self._fail(400, "bad_skill", "name 不能为空")
+                    with m.lock:
+                        m.flow_time()
+                        res = m.card.skill.use(
+                            name, q=body.get("q"),
+                            user_text=(body.get("user_text") or ""),
+                            source=(body.get("source") or "self"),
+                            hormones=getattr(m.card, "h", None))
+                    if res is None:
+                        return self._fail(404, "skill_not_found",
+                                          "没有这个技能：" + name)
+                    return self._send(200, {"ok": True, "use": res})
+                if path == "/config":
+                    # V5.0 §10.9 热改：写一条运行时配置（场景权重等）。
+                    # 为什么走 HTTP 而不是让人去 UPDATE 数据库：
+                    #   直接改库有两条路能搞坏 —— 忘了 bump `_rev`（改了不生效），
+                    #   或者写了个 6 个数对不上的值（那一格直接消失）。
+                    #   走这里至少能校验一次、能看见 bad。
+                    import ctxweight as _cw
+                    key = (body.get("key") or "").strip()
+                    if not key:
+                        return self._fail(400, "bad_config", "key 不能为空")
+                    if key.startswith("scene_weight:"):
+                        name = key.split(":", 1)[1].strip()
+                        name = _cw.SCENE_ALIAS.get(name.lower(), name)
+                        if name not in _cw.SCENE_WEIGHTS:
+                            return self._fail(
+                                400, "bad_config",
+                                "没有这个场景：%s（可选：%s）" % (
+                                    name, "、".join(_cw.SCENE_WEIGHTS.keys())))
+                        val = body.get("value")
+                        if isinstance(val, (list, tuple)):
+                            val = ",".join("%g" % float(x) for x in val)
+                        if _cw._parse_six(val) is None:
+                            return self._fail(
+                                400, "bad_config",
+                                "权重必须是 6 个 0~1 的数，逗号分隔，例如 "
+                                "0.18,0.16,0.26,0.10,0.24,0.06")
+                        key = "scene_weight:" + name
+                    with m.lock:
+                        rev = _cw.rc_set(m.card.db, key, body.get("value"),
+                                         ts=time.time())
+                        cfg = _cw.load_config(m.card.db, force=True)
+                    return self._send(200, {"ok": True, "key": key,
+                                            "rev": rev,
+                                            "bad": cfg["bad"],
+                                            "note": "下一轮 /context 立即生效，不用重启"})
+                if path == "/identity":
+                    # 改名。只允许改名字 —— 其余五条身份锚不给动，
+                    # 那是「换一个人」而不是「改个称呼」。
+                    new_name = (body.get("name") or "").strip()
+                    if not new_name:
+                        return self._fail(400, "bad_name", "名字不能为空")
+                    with m.lock:
+                        ok, msg = m.card.identity.set_name(new_name)
+                    if not ok:
+                        return self._fail(400, "rename_failed", msg)
+                    return self._send(200, {"ok": True, "name": new_name,
+                                            "msg": msg})
+                if path == "/avatar":
+                    # 换头像 / 恢复默认。前端已经把图缩成 512×512 PNG 再传，
+                    # 所以这里只做最基础的校验（是不是 PNG、多大）。
+                    import base64 as _b64
+                    with m.lock:
+                        if body.get("clear"):
+                            ok, msg = m.card.identity.clear_avatar()
+                        else:
+                            data = body.get("png") or ""
+                            if not data:
+                                return self._fail(400, "bad_avatar",
+                                                  "没收到图片数据")
+                            if isinstance(data, str) and data.startswith("data:"):
+                                data = data.split(",", 1)[-1]
+                            try:
+                                raw = _b64.b64decode(data, validate=False)
+                            except Exception as e:
+                                return self._fail(400, "bad_avatar",
+                                                  "base64 解不开：%s" % e)
+                            ok, msg = m.card.identity.set_avatar(raw)
+                    if not ok:
+                        return self._fail(400, "avatar_failed", msg)
+                    return self._send(200, {"ok": True, "msg": msg})
+                if path == "/cardslot":
+                    # 插卡 / 拔卡。必须显式给 action（inject|unload），
+                    # 不猜 —— 这两个动作会动 DSH 家目录里的 AGENTS.md，
+                    # 猜错一次就是「人设没了」。dry=true 只预览不落盘。
+                    import cardslot as _slot
+                    act = (body.get("action") or "").strip()
+                    dry = bool(body.get("dry"))
+                    if act == "inject":
+                        res = _slot.inject(dry=dry)
+                    elif act == "unload":
+                        res = _slot.unload(dry=dry)
+                    elif act == "status":
+                        res = {"ok": True, "steps": [],
+                               "state": _slot.status()}
+                    else:
+                        return self._fail(400, "bad_action",
+                                          "action 只能是 inject / unload / status")
+                    res["ok"] = bool(res.get("ok"))
+                    return self._send(200, res)
+                if path == "/shutdown":
+                    self._send(200, {"ok": True, "bye": True})
+                    threading.Thread(target=_shutdown_later, daemon=True).start()
+                    return
+
+            return self._fail(404, "not_found", "%s %s" % (method, path))
+        except ValueError as e:
+            return self._fail(400, "bad_request", str(e))
+        except Exception as e:
+            tb = traceback.format_exc(limit=3)
+            m.errors += 1
+            return self._send(500, {
+                "ok": False, "error": "internal_error",
+                "detail": "%s: %s" % (type(e).__name__, e),
+                "trace": tb})
+
+    def do_GET(self):
+        self._route("GET")
+
+    def do_POST(self):
+        self._route("POST")
+
+
+def _shutdown_later():
+    time.sleep(0.3)
+    os._exit(0)
+
+
+class ExclusiveServer(ThreadingHTTPServer):
+    # Windows 上 SO_REUSEADDR 不是「复用」，而是「允许别人抢占同一个端口」：
+    # 两个进程都能 bind 成功，请求落到谁手里看运气。于是旧代码的服务
+    # 可以一直活着把新进程的请求全接走 —— 改完代码像没改一样，
+    # 2026-11-01 就踩了这个坑（三个 mind_server 同时「在跑」，
+    # /health 少的那个 semantic 段怎么也刷不出来）。
+    # 关掉它：第二个实例 bind 直接报错退出，一眼看出端口被占。
+    allow_reuse_address = (os.name != "nt")
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description="鲸鱼娘数字生命卡 · 心智服务")
+    ap.add_argument("--host", default="127.0.0.1")
+    ap.add_argument("--port", type=int, default=DEFAULT_PORT)
+    ap.add_argument("--db", default=DEFAULT_DB)
+    a = ap.parse_args(argv)
+
+    if not os.path.exists(a.db):
+        print("[mind] 找不到卡：%s" % os.path.abspath(a.db), file=sys.stderr)
+        print("[mind] 先用 import_live.py / import_full.py 灌记忆，或指定 --db",
+              file=sys.stderr)
+        return 2
+
+    # 先抢端口，再开卡：开卡要加载模型、跑唤醒结算（十几秒），
+    # 端口要是被占，这些都是白干的副作用。
+    srv = None
+    try:
+        srv = ExclusiveServer((a.host, a.port), Handler)
+    except OSError as e:
+        print("[mind] 端口 %d 已被占用（%s）" % (a.port, e), file=sys.stderr)
+        print("[mind] 多半是旧的服务还在跑。先把它停掉："
+              "Get-Process python | Where-Object {$_.CommandLine -like '*mind_server*'}",
+              file=sys.stderr)
+        return 3
+    srv.daemon_threads = True
+    mind = Mind(a.db)
+    Handler.mind = mind
+    st = mind.card.stats()
+    print("[mind] 卡已打开：%s" % os.path.abspath(a.db))
+    print("[mind] %d 条记忆 / %d 条细节 / 盖章=%s"
+          % (st["total"], st["details"], mind.sealed))
+    print("[mind] 听在 http://%s:%d  （Ctrl+C 退出）" % (a.host, a.port))
+    sys.stdout.flush()
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        print("\n[mind] 收工")
+    finally:
+        srv.server_close()
+        mind.close()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

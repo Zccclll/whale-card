@@ -1,0 +1,7 @@
+.venv/
+card.db
+card.db-*
+*.db-wal
+*.db-shm
+__pycache__/
+demo/demo_card.db*
