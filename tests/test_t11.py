@@ -107,16 +107,23 @@ def main():
 
     # ---- 第五步：旧库兼容 —— 老 card.db 能正常打开 ----
     ok6 = True
-    try:
-        old = card2.MemoryCard(os.path.join(os.path.dirname(os.path.abspath(__file__)), "card.db"))
-        st = old.stats()
-        ok6 = st["total"] >= 323
-        print(("  ✅" if ok6 else "  ❌") +
-              f" 老库兼容：{st['total']} 条")
-        old.close()
-    except Exception as e:
-        ok6 = False
-        print(f"  ❌ 老库打开失败: {e}")
+    legacy = os.path.join(os.path.dirname(os.path.abspath(__file__)), "card.db")
+    if not os.path.exists(legacy):
+        # 修复（大肥鱼 2026-11-02）：原来文件不存在也直接 MemoryCard(legacy)，
+        # 会顺手造出一个空 card.db —— 自己判失败，还污染 test_card2.py
+        # 第 9 节「文件不存在则跳过」的守卫。缺夹具就干净跳过。
+        print("  （跳过老库兼容：tests/card.db 夹具不随仓库发布）")
+    else:
+        try:
+            old = card2.MemoryCard(legacy)
+            st = old.stats()
+            ok6 = st["total"] >= 323
+            print(("  ✅" if ok6 else "  ❌") +
+                  f" 老库兼容：{st['total']} 条")
+            old.close()
+        except Exception as e:
+            ok6 = False
+            print(f"  ❌ 老库打开失败: {e}")
 
     card.close()
     try:

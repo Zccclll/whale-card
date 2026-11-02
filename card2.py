@@ -3046,6 +3046,60 @@ class MemoryCard:
             self.db.commit()
         return n
 
+    # ---------- 时态建模（fork 新增 2026-11-02，借鉴 Zep/Graphiti） ----------
+    # 作者原版只有底色层会 supersede（演化改写）；中期层的「新事实推翻旧事实」
+    # 没有出口 —— 旧事实会一直跟新事实抢召回。这里补上：失效只打标记，
+    # 行不删、正文不动（和拔刺同一原则），默认检索沉下去，history=True 能翻出来。
+    def invalidate(self, mid, by=None, ts=None):
+        """把一条旧事实标为失效：valid_until 钉在当前时刻，可记上取代它的新条。
+
+        幂等：已过期的返回 False。只动 valid_until/superseded_by 两列，
+        raw 不碰 —— 出生证哈希不受影响，审计链完整。
+        """
+        c = self.db.cursor()
+        r = c.execute("SELECT * FROM mem WHERE id=?", (int(mid),)).fetchone()
+        if r is None:
+            raise KeyError("没有这条记忆：%s" % mid)
+        now = float(ts or self.clock.now())
+        if r["valid_until"] and 0 < r["valid_until"] <= now:
+            return False
+        c.execute(
+            "UPDATE mem SET valid_until=?,"
+            " superseded_by=COALESCE(?, superseded_by) WHERE id=?",
+            (now, int(by) if by is not None else None, int(mid)))
+        self.db.commit()
+        return True
+
+    def replace_fact(self, old_mid, text, **kw):
+        """写一条新事实，同时把旧事实标失效（新盖旧、旧不删）。返回新条 id。"""
+        new_mid = self.remember(text, **kw)
+        self.invalidate(old_mid, by=new_mid)
+        return new_mid
+
+    def history_of(self, mid, max_gen=20):
+        """沿 superseded_by 链取这条事实的所有世代（旧→新）。
+
+        每代带 prior（该条自己的演化史 JSON），够拼出完整时间线。
+        """
+        c = self.db.cursor()
+        out, cur, seen = [], int(mid), set()
+        while cur and cur not in seen and len(out) < max_gen:
+            seen.add(cur)
+            r = c.execute(
+                "SELECT id, core, valid_until, superseded_by, history"
+                " FROM mem WHERE id=?", (cur,)).fetchone()
+            if r is None:
+                break
+            try:
+                own = json.loads(r["history"] or "[]")
+            except Exception:
+                own = []
+            out.append({"id": r["id"], "text": r["core"],
+                        "valid_until": r["valid_until"],
+                        "superseded_by": r["superseded_by"], "prior": own})
+            cur = r["superseded_by"]
+        return out
+
     # ---------- 爱好预算 / 角色标签 ----------
     def hobby_list(self):
         c = self.db.cursor()
@@ -3681,7 +3735,7 @@ class MemoryCard:
         return None
 
     def recall(self, query, top_k=3, access=True, pools=None, regions=None,
-               assoc=True):
+               assoc=True, history=False):
         """三因子：像不像 × 还清不清楚 × 多久没提
 
         🔧 第二期改进：
@@ -3723,6 +3777,13 @@ class MemoryCard:
         else:
             rows = c.execute("SELECT * FROM mem WHERE pool != ?",
                              (POOL_ARCHIVE,)).fetchall()
+        if not history:
+            # 时态过滤（fork 新增）：被标失效/被新事实取代的条目不参与默认检索。
+            # valid_until 还在未来的（有效期内的处境）不受影响；
+            # history=True 可以翻旧账 —— 「我以前住哪」这种问题走这条路。
+            rows = [r for r in rows
+                    if not (r["superseded_by"] or
+                            (r["valid_until"] and 0 < r["valid_until"] < now))]
 
         # ---- T4-2 时间窗预筛 ----
         # 问「今天」就别翻三年前的；问「以前」就不限。
