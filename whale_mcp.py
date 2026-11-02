@@ -112,9 +112,18 @@ def _err(msg):
 def _build():
     from mcp.server.fastmcp import FastMCP
 
+    # 只读模式（大肥鱼 fork 2026-11-02）：WHALE_MCP_READONLY=1 时不注册写侧工具
+    # （mind_report / mind_skill_use / mind_tick），试跑期只看不写，
+    # 防止和现有记忆系统双写打架。
+    _ro = os.environ.get("WHALE_MCP_READONLY", "").strip().lower() in ("1", "true", "yes")
+
     m = FastMCP(
         "whale",
         instructions=(
+            "这是大肥鱼数字生命卡的通道（只读试跑，不许写卡）。规矩：\n"
+            "1. 需要回忆时先调 mind_context / mind_recall，把返回的 prompt 当作【我记得什么】的依据。\n"
+            "2. 卡里没说的，就是没有。不许用印象补全成「记得」。\n"
+        ) if _ro else (
             "这是鲸鱼娘数字生命卡的通道。规矩：\n"
             "1. 每次回话前先调 mind_context，把返回的 prompt 当作【我是谁 / 我记得什么】的依据。\n"
             "2. 回完话调 mind_report 把这一轮写回卡（他会问的和你答的都要写）。\n"
@@ -229,6 +238,12 @@ def _build():
             return _err("心智服务连不上（8848）")
         out = _post("/tick", {"seconds": float(seconds), "confirm": bool(confirm)})
         return {"ok": True, "result": out}
+
+    if _ro:
+        tm = getattr(m, "_tool_manager", None)
+        if tm is not None:
+            for _n in ("mind_report", "mind_skill_use", "mind_tick"):
+                getattr(tm, "_tools", {}).pop(_n, None)
 
     return m
 
