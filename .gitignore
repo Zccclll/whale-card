@@ -5,3 +5,7 @@ card.db-*
 *.db-shm
 __pycache__/
 demo/demo_card.db*
+_t7*/
+tests/anchor.*.json
+demo/anchor.*.json
+tests/_t61_tmp.db*
